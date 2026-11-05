@@ -93,13 +93,12 @@ def estudiante(api) -> dict:
 
 
 @pytest.fixture(scope="session")
-def cupos_stub():
+def cupos_stub(tmp_path_factory):
     """Stub gRPC generado al vuelo desde proto/cupos.proto (paquete `cupo`,
     servicio `Cupos`, métodos camelCase, claves de idempotencia en Ocupar/Liberar)."""
-    grpc = pytest.importorskip("grpc")
-    tools = pytest.importorskip("grpc_tools.protoc")
-    out = ROOT / "tests" / ".generated"
-    out.mkdir(exist_ok=True)
+    import grpc
+    from grpc_tools import protoc as tools
+    out = tmp_path_factory.mktemp("cupos_contract_stubs")
     proto_dir = ROOT / "proto"
     rc = tools.main(["protoc", f"-I{proto_dir}", f"--python_out={out}", f"--grpc_python_out={out}",
                      str(proto_dir / "cupos.proto")])
@@ -107,13 +106,15 @@ def cupos_stub():
     sys.path.insert(0, str(out))
     pb2 = importlib.import_module("cupos_pb2")
     pb2_grpc = importlib.import_module("cupos_pb2_grpc")
-    channel = grpc.insecure_channel(CUPOS_GRPC_ADDR)
+    from tests.support.servicios import esperar_cupos
     try:
-        grpc.channel_ready_future(channel).result(timeout=3)
-    except grpc.FutureTimeoutError:
-        pytest.skip(f"Cupos gRPC no accesible en {CUPOS_GRPC_ADDR} (¿levantaste el servicio?)")
-    stub = pb2_grpc.CuposStub(channel)
-    return type("CuposCtx", (), {"pb2": pb2, "stub": stub, "grpc": grpc})
+        esperar_cupos(CUPOS_GRPC_ADDR, timeout=10)
+    except RuntimeError as exc:
+        pytest.fail(str(exc), pytrace=False)
+    with grpc.insecure_channel(CUPOS_GRPC_ADDR) as channel:
+        stub = pb2_grpc.CuposStub(channel)
+        yield type("CuposCtx", (), {"pb2": pb2, "stub": stub, "grpc": grpc})
+    sys.path.remove(str(out))
 
 
 @pytest.fixture

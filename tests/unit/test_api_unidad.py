@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,10 +20,7 @@ import pytest
 
 from tests.conftest import ROOT, rut_valido
 
-pytest.importorskip("fastapi")
-pytest.importorskip("pydantic_settings")
-pytest.importorskip("sqlalchemy")
-TestClient = pytest.importorskip("fastapi.testclient").TestClient
+from fastapi.testclient import TestClient
 
 ADMIN = secrets.token_urlsafe(32)
 
@@ -30,25 +28,33 @@ ADMIN = secrets.token_urlsafe(32)
 @pytest.fixture(scope="module")
 def m():
     api_dir = ROOT / "matriculas-api"
-    if not (api_dir / "app" / "grpc_stubs" / "cupos_pb2.py").exists():
-        subprocess.run([sys.executable, str(api_dir / "generar_stubs.py")], check=True, capture_output=True)
     tmp = Path(tempfile.mkdtemp(prefix="mat_unit_"))
+    # No importar archivos generados en otro intérprete desde el repo montado.
+    shutil.copytree(api_dir / "app", tmp / "app",
+                    ignore=shutil.ignore_patterns("grpc_stubs", "__pycache__"))
+    subprocess.run([sys.executable, str(api_dir / "generar_stubs.py"),
+                    "--destino", str(tmp / "app" / "grpc_stubs")],
+                   check=True, capture_output=True)
     previo = {k: os.environ.get(k) for k in ("API_KEYS", "JWT_SECRET", "DATABASE_URL", "RECONCILE_INTERVAL_SECONDS")}
     os.environ.update(API_KEYS=ADMIN, JWT_SECRET=secrets.token_urlsafe(32),
                       DATABASE_URL=f"sqlite:///{tmp / 'm.db'}", RECONCILE_INTERVAL_SECONDS="0")
-    sys.path.insert(0, str(api_dir))
+    sys.path.insert(0, str(tmp))
     for nombre in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
         sys.modules.pop(nombre)
-    ns = type("Mods", (), {})()
-    ns.config = importlib.import_module("app.config")
-    ns.security = importlib.import_module("app.security")
-    ns.ratelimit = importlib.import_module("app.ratelimit")
-    ns.database = importlib.import_module("app.database")
-    ns.models = importlib.import_module("app.models")
-    ns.main = importlib.import_module("app.main")
-    yield ns
-    for k, v in previo.items():
-        os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    try:
+        ns = type("Mods", (), {})()
+        ns.config = importlib.import_module("app.config")
+        ns.security = importlib.import_module("app.security")
+        ns.ratelimit = importlib.import_module("app.ratelimit")
+        ns.database = importlib.import_module("app.database")
+        ns.models = importlib.import_module("app.models")
+        ns.main = importlib.import_module("app.main")
+        yield ns
+    finally:
+        sys.path.remove(str(tmp))
+        for k, v in previo.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
 
 
 @pytest.fixture

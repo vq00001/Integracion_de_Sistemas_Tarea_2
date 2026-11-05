@@ -9,7 +9,7 @@ qué `curso_id` existen. Ahora:
   GET /v1/courses/{curso_id}      → el curso (404 si no existe)
 
 Ambas se sirven de un caché en memoria con TTL corto (ver cursos_cache.py). El número de cupos
-es REFERENCIAL: la decisión final la toma POST /v1/enrollments.
+es REFERENCIAL: Cupos decide la reserva dentro de la saga.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _cabeceras(response: Response, desde_cache: bool) -> None:
     description=(
         "Cursos de Cupos con `cupos_libres`. Con `disponibles=true` solo los que tienen cupos. "
         "El dato puede tener hasta `CURSOS_CACHE_TTL_SECONDS` segundos de antigüedad: para "
-        "reservar, usa `POST /v1/enrollments`."
+        "matricular con reserva, usa `POST /v1/matriculas` en el gateway."
     ),
     responses=_ERRORES,
 )

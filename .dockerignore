@@ -7,3 +7,6 @@ node_modules
 *.db
 experiment/data/raw
 experiment/results
+
+# Generar stubs con las dependencias de cada imagen.
+matriculas-api/app/grpc_stubs/cupos_pb2*.py

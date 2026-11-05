@@ -9,8 +9,8 @@ El contrato gRPC de cupos es el siguiente:
 - listarCursos() -> cursos[]
 - listarCursosDisponibles() -> cursos[] (excluye cursos llenos)
 - ocuparCupo(curso_id, idempotency_key) -> estado (CUPO_OCUPADO | SIN_CUPOS)
-- liberarCupo(curso_id, idempotency_key) -> estado (CUPO_LIBERADO | FAILED_PRECONDITION).
-  Solo libera lo que ESA clave ocupó (invariante de capacidad protegido por Cupos).
+- liberarCupo(curso_id, idempotency_key) -> CUPO_LIBERADO; sin reserva es no-op.
+  Solo incrementa capacidad si ESA clave ocupó; registra cancelaciones anticipadas.
 - consultarOperacion(idempotency_key) -> qué ocupó / liberó esa clave (solo lectura)
 - idempotencia:
   - ocuparCupo con la misma idempotency_key no debe descontar más de un cupo
@@ -112,18 +112,19 @@ def _libres(cupos_stub, curso_id):
     return cupos_stub.stub.obtenerCupo(cupos_stub.pb2.ObtenerRequest(curso_id=curso_id)).cupos_libres
 
 
-def test_liberar_con_clave_inventada_se_rechaza_y_no_sube_los_cupos(cupos_stub):
-    """El ataque original: 1 matrícula en un curso de 2 cupos y un liberarCupo con clave nueva
-    subía los libres a 2 (sobreventa). Ahora Cupos exige que la clave haya ocupado ese curso."""
-    pb2, stub, grpc = cupos_stub.pb2, cupos_stub.stub, cupos_stub.grpc
-    clave = uuid.uuid4().hex
-    stub.ocuparCupo(pb2.OcuparRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
-    antes = _libres(cupos_stub, CURSO_CON_CUPO)
+def test_liberar_sin_reserva_es_noop_y_rechaza_ocupacion_tardia(cupos_stub):
+    pb, stub, grpc = cupos_stub.pb2, cupos_stub.stub, cupos_stub.grpc
+    owner, key = uuid.uuid4().hex, uuid.uuid4().hex
+    stub.ocuparCupo(pb.OcuparRequest(curso_id=CURSO_CON_CUPO,idempotency_key=owner))
+    before=_libres(cupos_stub,CURSO_CON_CUPO)
+    for _ in range(2):
+        r=stub.liberarCupo(pb.LiberarRequest(curso_id=CURSO_CON_CUPO,idempotency_key=key))
+        assert r.estado == pb.CUPO_LIBERADO
+    assert _libres(cupos_stub,CURSO_CON_CUPO) == before
     with pytest.raises(grpc.RpcError) as e:
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key="inventada-" + uuid.uuid4().hex))
+        stub.ocuparCupo(pb.OcuparRequest(curso_id=CURSO_CON_CUPO,idempotency_key=key))
     assert e.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert _libres(cupos_stub, CURSO_CON_CUPO) == antes, "una clave que nunca ocupó liberó un cupo"
-    stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
+    stub.liberarCupo(pb.LiberarRequest(curso_id=CURSO_CON_CUPO,idempotency_key=owner))
 
 
 def test_liberar_una_clave_en_otro_curso_se_rechaza(cupos_stub):
@@ -137,28 +138,19 @@ def test_liberar_una_clave_en_otro_curso_se_rechaza(cupos_stub):
     stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
 
 
-def test_no_se_libera_dos_veces_lo_ocupado_una_vez(cupos_stub):
-    """Una ocupación se libera UNA vez: no hay otra clave con la que 'volver a liberarla'."""
-    pb2, stub, grpc = cupos_stub.pb2, cupos_stub.stub, cupos_stub.grpc
-    clave = uuid.uuid4().hex
-    stub.ocuparCupo(pb2.OcuparRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
-    stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
-    libres = _libres(cupos_stub, CURSO_CON_CUPO)
-    with pytest.raises(grpc.RpcError) as e:
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=uuid.uuid4().hex))
-    assert e.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert _libres(cupos_stub, CURSO_CON_CUPO) == libres
+def test_clave_nueva_no_devuelve_cupos_ajenos(cupos_stub):
+    pb, stub = cupos_stub.pb2, cupos_stub.stub
+    before=_libres(cupos_stub,CURSO_CON_CUPO)
+    assert stub.liberarCupo(pb.LiberarRequest(curso_id=CURSO_CON_CUPO,idempotency_key=uuid.uuid4().hex)).estado == pb.CUPO_LIBERADO
+    assert _libres(cupos_stub,CURSO_CON_CUPO) == before
 
 
-def test_liberar_la_ocupacion_rechazada_por_sin_cupos_no_devuelve_nada(cupos_stub, curso_lleno):
-    """Una clave cuyo ocupar dio SIN_CUPOS no retuvo nada: liberarla no puede sumar un cupo."""
-    pb2, stub, grpc = cupos_stub.pb2, cupos_stub.stub, cupos_stub.grpc
-    clave = uuid.uuid4().hex
-    assert stub.ocuparCupo(pb2.OcuparRequest(curso_id=curso_lleno, idempotency_key=clave)).estado == pb2.SIN_CUPOS
-    with pytest.raises(grpc.RpcError) as e:
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=curso_lleno, idempotency_key=clave))
-    assert e.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert _libres(cupos_stub, curso_lleno) == 0
+def test_liberar_reserva_rechazada_es_noop(cupos_stub, curso_lleno):
+    pb, stub = cupos_stub.pb2, cupos_stub.stub
+    key=uuid.uuid4().hex
+    assert stub.ocuparCupo(pb.OcuparRequest(curso_id=curso_lleno,idempotency_key=key)).estado == pb.SIN_CUPOS
+    assert stub.liberarCupo(pb.LiberarRequest(curso_id=curso_lleno,idempotency_key=key)).estado == pb.CUPO_LIBERADO
+    assert _libres(cupos_stub,curso_lleno) == 0
 
 
 def test_clave_vacia_se_rechaza(cupos_stub):

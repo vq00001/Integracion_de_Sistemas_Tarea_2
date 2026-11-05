@@ -25,8 +25,8 @@ service Cupos {
   rpc ocuparCupo(OcuparRequest) returns (OcuparResponse);
 
   // Libera el cupo que ocupó EXACTAMENTE esa idempotency_key. Cupos es dueño del
-  // invariante de capacidad: una clave que nunca ocupó (o ya liberada con otra
-  // llamada) se rechaza con FAILED_PRECONDITION; no basta con que haya espacio.
+  // invariante de capacidad: si no ocupó, liberar es no-op y registra una cancelación
+  // anticipada. Un ocupar posterior de esa clave se rechaza con FAILED_PRECONDITION.
   rpc liberarCupo(LiberarRequest) returns (LiberarResponse);
 
   // Solo lectura. Dice qué pasó con una clave (ocupó / liberó / nada). Lo usa el
@@ -83,7 +83,7 @@ message LiberarResponse {
 
 // Convención de errores de este contrato (ver D3): un resultado de NEGOCIO esperable viaja
 // en el enum `Estado` (SIN_CUPOS, CURSO_NO_ENCONTRADO); una operación que viola una
-// PRECONDICIÓN (liberar lo no ocupado) o un argumento inválido (clave vacía, clave usada
+// PRECONDICIÓN (ocupar una clave cancelada) o un argumento inválido (clave vacía, clave usada
 // con otro curso) viaja como status gRPC (FAILED_PRECONDITION / INVALID_ARGUMENT).
 // obtenerCupo conserva NOT_FOUND por compatibilidad con v1; cupo.v2 lo unificará.
 

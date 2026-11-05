@@ -35,6 +35,7 @@ def cargar_esquema(url: str | None) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--desde-url", help="URL de /openapi.json de la API en ejecución")
+    ap.add_argument("--orquestador-desde-url", help="URL de /openapi.json del orquestador (opcional)")
     args = ap.parse_args()
 
     schema = cargar_esquema(args.desde_url)
@@ -45,6 +46,18 @@ def main() -> None:
         json.dumps(schema, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     (docs / "openapi.yaml").write_text(
         yaml.safe_dump(schema, sort_keys=False, allow_unicode=True), encoding="utf-8", newline="\n")
+    # Una exportación remota no requiere FastAPI, stubs gRPC ni configuración local.
+    # El contrato del orquestador solo cambia si se exporta localmente o se da su URL.
+    orchestrator_schema = None
+    if args.orquestador_desde_url:
+        with urllib.request.urlopen(args.orquestador_desde_url, timeout=15) as response:
+            orchestrator_schema = json.load(response)
+    elif not args.desde_url:
+        from app.orchestrator_main import app as orchestrator_app
+        orchestrator_schema = orchestrator_app.openapi()
+    if orchestrator_schema is not None:
+        (docs / "orchestrator.openapi.json").write_text(
+            json.dumps(orchestrator_schema, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Contrato exportado en {docs}/openapi.json y openapi.yaml")
 
 

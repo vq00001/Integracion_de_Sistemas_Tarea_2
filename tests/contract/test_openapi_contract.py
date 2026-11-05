@@ -53,7 +53,8 @@ def test_el_contrato_declara_autenticacion_y_idempotencia(spec):
     assert spec["components"]["securitySchemes"]["ApiKeyAuth"]["name"] == "X-API-Key"
     params = spec["paths"]["/v1/enrollments"]["post"]["parameters"]
     assert any(p["name"] == "Idempotency-Key" and p["in"] == "header" for p in params)
-    assert "504" in spec["paths"]["/v1/enrollments"]["post"]["responses"]
+    assert "503" in spec["paths"]["/v1/enrollments"]["post"]["responses"]
+    assert "504" not in spec["paths"]["/v1/enrollments"]["post"]["responses"]
     # Hay permisos por estudiante: 403 (autenticado, pero no puede operar sobre ese recurso).
     assert "403" in spec["paths"]["/v1/enrollments"]["post"]["responses"]
     assert "403" in spec["paths"]["/v1/students"]["post"]["responses"]

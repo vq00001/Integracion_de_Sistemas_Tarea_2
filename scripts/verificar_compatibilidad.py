@@ -202,6 +202,22 @@ def comparar_openapi(base: dict, actual: dict) -> tuple[list[str], list[str]]:
     return errores, avisos
 
 
+# Migración U1 → saga solicitada: Inscripción ya no propaga fallas de Cupos.
+# La base histórica se conserva. Solo se aceptan estas eliminaciones concretas;
+# cualquier otra ruptura sigue fallando. Ver docs/saga.md.
+CAMBIOS_SAGA = {
+    f"POST {route}: código de respuesta eliminado {code}"
+    for route, codes in {
+        "/v1/enrollments": (502, 504),
+        "/v1/enrollments/{enrollment_id}/revert": (409, 500, 502, 503, 504),
+    }.items() for code in codes
+}
+
+
+def errores_no_autorizados(errores):
+    return [error for error in errores if error not in CAMBIOS_SAGA]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--actualizar-base", action="store_true", help="la versión actual pasa a ser la base (al publicar)")
@@ -222,6 +238,9 @@ def main() -> int:
     err_proto = comparar_proto(base_ds, descriptor_set(PROTO))
     err_api, avisos = comparar_openapi(json.loads((BASE / "openapi.base.json").read_text(encoding="utf-8")),
                                        json.loads(OPENAPI.read_text(encoding="utf-8")))
+    for e in set(err_api) & CAMBIOS_SAGA:
+        print("MIGRACIÓN [OpenAPI] ", e)
+    err_api = errores_no_autorizados(err_api)
     for e in err_proto:
         print("ROMPE  [.proto]  ", e)
     for e in err_api:

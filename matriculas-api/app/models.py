@@ -16,10 +16,10 @@ def _uuid() -> str:
 
 
 class EstadoMatricula(str, enum.Enum):
-    PENDIENTE = "PENDIENTE"     # Intención registrada; aún no se sabe el resultado en Cupos
-    CONFIRMADA = "CONFIRMADA"   # Cupos confirmó disponibilidad y el cupo quedó ocupado
+    PENDIENTE = "PENDIENTE"     # Estado histórico de U1; no se crean filas nuevas en él
+    CONFIRMADA = "CONFIRMADA"   # Inscripción ACTIVA local
     RECHAZADA = "RECHAZADA"     # Reservado (hoy los rechazos definitivos no se persisten)
-    ANULADA = "ANULADA"         # Revertida por el usuario o cerrada por el conciliador; el cupo quedó libre
+    ANULADA = "ANULADA"         # Baja local o cancelación anticipada por clave
 
 
 # Estados "activos": ocupan (o podrían estar ocupando) un cupo del curso.
@@ -76,14 +76,7 @@ class StudentCredential(Base):
 
 
 class Enrollment(Base):
-    """
-    Una matrícula asocia a un estudiante con un curso de Cupos (`curso_id`,
-    el identificador que vive en el servicio Cupos vía gRPC). A diferencia
-    del estado pre-integración (donde se guardaba un `codigo_curso` de
-    texto libre sin validar), aquí `curso_id` siempre corresponde a un
-    curso que fue consultado/reservado contra Cupos antes de confirmar la
-    matrícula: esa es justamente la integración que implementa esta API.
-    """
+    """Inscripción local. CONFIRMADA es ACTIVA; ANULADA es la baja."""
 
     __tablename__ = "enrollments"
     __table_args__ = (
@@ -117,11 +110,7 @@ class Enrollment(Base):
         Enum(EstadoMatricula, native_enum=False, length=20), nullable=False
     )
     motivo: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Clave de idempotencia enviada a Cupos (ocuparCupo / liberarCupo). Es un
-    # UUID interno, opaco y estable para esta matrícula: no contiene datos
-    # personales. Como la fila se inserta ANTES de llamar a Cupos, cualquier
-    # reintento (del cliente o del conciliador) reutiliza la misma clave y
-    # Cupos no ocupa ni libera el cupo dos veces.
+    # Identificador histórico U1; se conserva para migrar reservas antiguas.
     idempotency_key: Mapped[str] = mapped_column(String(36), nullable=False, default=_uuid)
     # Cabecera Idempotency-Key enviada por el cliente de la API REST (opcional).
     # Si el cliente reintenta con la misma clave, recibe la misma matrícula.

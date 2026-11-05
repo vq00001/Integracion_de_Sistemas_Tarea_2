@@ -10,78 +10,19 @@ from fastapi.openapi.utils import get_openapi
 from .config import settings, validar_claves_admin, validar_secreto_jwt
 from .database import init_db
 from .errors import register_exception_handlers
-from .reconciler import Conciliador
 from .routers import courses, enrollments, health, students
 
-DESCRIPTION = """
-API REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.
-
-Permite gestionar estudiantes y sus matrículas. Antes de confirmar una
-matrícula, valida en tiempo real la disponibilidad de cupos consultando
-al servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).
-
-### Autenticación
-Los endpoints de negocio aceptan `X-API-Key` (integraciones existentes) o un JWT local
-`Authorization: Bearer ...` (usuarios). Ambos aplican autorización por propietario:
-
-* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y
-  listar estudiantes y emitir o revocar claves de estudiante.
-* **Estudiante** (API key emitida o token JWT): solo permite
-  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra
-  persona responde `403`; las matrículas ajenas responden `404`.
-
-Ver la sección "Autenticación" del README. Los intentos de autenticación fallidos se limitan
-por IP (`429` + `Retry-After`) y un estudiante con clave propia tiene un tope de escrituras por minuto.
-
-### Cursos y disponibilidad
-`GET /v1/courses` y `GET /v1/courses/{curso_id}` informan los cupos libres (dato **referencial**,
-con caché de unos segundos). Quien decide si hay cupo es siempre `POST /v1/enrollments`.
-
-### Errores
-Todas las respuestas de error usan el mismo formato JSON:
-
-```json
-{"error": {"code": "SIN_CUPOS", "message": "...", "details": null}}
-```
-
-### Idempotencia
-`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la
-misma clave devuelve la misma matrícula y nunca consume un segundo cupo.
-
-### Disponibilidad de Cupos
-Los endpoints que dependen de Cupos (`POST /v1/enrollments`,
-`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:
-
-* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es
-  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).
-* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida). Si la conexión
-  se rechazó (la solicitud nunca salió) no queda nada pendiente y se puede reintentar con
-  una Idempotency-Key nueva o la misma. Incluye `Retry-After`.
-* `502 Bad Gateway`: Cupos respondió con un error interno inesperado. Por precaución la
-  matrícula también queda `PENDIENTE` y se concilia.
-
-Una matrícula `PENDIENTE` se resuelve reintentando con la misma
-`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el
-conciliador la anula y libera el cupo. La lectura de datos ya existentes
-(estudiantes y matrículas) no se ve afectada por una caída de Cupos.
+DESCRIPTION = """Servicio de Inscripción. Gestiona alumnos e inscripciones locales.
+La reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción ACTIVA.
+La misma Idempotency-Key devuelve la inscripción existente; repetir la baja devuelve 200.
 """
-
-_conciliador: Conciliador | None = None
-
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _conciliador
-    # Fail-closed: sin clave admin propia (o con una pública/corta) la API NO arranca.
     validar_claves_admin(settings.admin_api_keys)
     validar_secreto_jwt(settings.jwt_secret)
     init_db()
-    if settings.reconcile_interval_seconds > 0:
-        _conciliador = Conciliador(settings.reconcile_interval_seconds)
-        _conciliador.start()
     yield
-    if _conciliador is not None:
-        _conciliador.detener()
 
 
 app = FastAPI(
@@ -127,6 +68,8 @@ app.include_router(auth.router)
 app.include_router(students.router)
 app.include_router(courses.router)
 app.include_router(enrollments.router)
+from .faults import router as internal_router
+app.include_router(internal_router)
 
 
 def custom_openapi():

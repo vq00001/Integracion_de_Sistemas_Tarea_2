@@ -1,4 +1,4 @@
-"""Flujo funcional de la API REST (T2, T6) y su integración con Cupos."""
+"""Flujo funcional de Inscripción y alumnos; Cupos lo coordina la saga."""
 import uuid
 
 import pytest
@@ -95,23 +95,19 @@ def test_matricula_valida(api, estudiante):
     m = r.json()
     assert m["estado"] == "CONFIRMADA"
     assert api.get(f"/v1/enrollments/{m['id']}").status_code == 200
-    api.post(f"/v1/enrollments/{m['id']}/revert")  # limpieza (libera el cupo)
+    api.post(f"/v1/enrollments/{m['id']}/revert")  # limpieza local
 
 
-def test_matricula_sin_cupos_es_rechazada_con_409(api, estudiante, curso_lleno):
-    """Verifica que no se crea una matrícula si el curso ya está agotado."""
-    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": curso_lleno})
-    assert r.status_code == 409
-    assert r.json()["error"]["code"] == "SIN_CUPOS"
-    # el rechazo no debe dejar una matrícula registrada
-    lista = api.get("/v1/enrollments", params={"student_id": estudiante["id"]}).json()
-    assert lista["items"] == []
+def test_inscripcion_no_vuelve_a_reservar_un_curso_lleno(api, estudiante, curso_lleno):
+    r = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':curso_lleno})
+    assert r.status_code == 201
+    api.post(f"/v1/enrollments/{r.json()['id']}/revert")
 
 
-def test_matricula_curso_inexistente_da_404(api, estudiante):
-    """Comprueba que una matrícula para un curso inexistente devuelve 404."""
-    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": 999999})
-    assert r.status_code == 404
+def test_inscripcion_delega_validacion_del_curso_al_orquestador(api, estudiante):
+    r = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':999999})
+    assert r.status_code == 201
+    api.post(f"/v1/enrollments/{r.json()['id']}/revert")
 
 
 def test_matricula_estudiante_inexistente_da_404(api):
@@ -146,18 +142,15 @@ def test_revertir_inexistente_da_404(api):
 # ---------- Integración REST <-> gRPC: el cupo realmente se mueve ----------
 
 @pytest.mark.grpc
-def test_matricular_y_revertir_mueve_el_cupo(api, estudiante, cupos_stub):
-    """Verifica la integración real: la API debe descontar y devolver el cupo al revertir la matrícula."""
-    pb2, stub = cupos_stub.pb2, cupos_stub.stub
-    antes = stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
-
-    m = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}).json()
-    durante = stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
-    assert durante == antes - 1
-
-    api.post(f"/v1/enrollments/{m['id']}/revert")
-    despues = stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
-    assert despues == antes
+def test_inscribir_y_dar_baja_no_modifica_cupos(api, estudiante, cupos_stub):
+    pb, stub = cupos_stub.pb2, cupos_stub.stub
+    libres = lambda: stub.obtenerCupo(pb.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
+    before = libres()
+    m = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':CURSO_CON_CUPO}).json()
+    assert libres() == before
+    for _ in range(2):
+        assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 200
+    assert libres() == before
 
 
 def test_filtro_por_rut_acepta_el_formato_con_puntos(api, estudiante):

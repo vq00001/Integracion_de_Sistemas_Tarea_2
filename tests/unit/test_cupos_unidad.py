@@ -39,7 +39,7 @@ class ContextoFalso:
 
 @pytest.fixture(scope="module")
 def srv():
-    grpc_tools = pytest.importorskip("grpc_tools.protoc")
+    from grpc_tools import protoc as grpc_tools
     out = Path(tempfile.mkdtemp(prefix="cupos_stubs_"))
     proto_dir = ROOT / "proto"
     rc = grpc_tools.main(["protoc", f"-I{proto_dir}", f"--python_out={out}", f"--grpc_python_out={out}",
@@ -118,3 +118,18 @@ def test_purga_borra_lo_cerrado_y_conserva_la_ocupacion_vigente(srv, servicio):
     # y la ocupación vigente sigue pudiendo liberarse (el invariante no depende de la antigüedad)
     assert servicio.liberarCupo(pb2.LiberarRequest(curso_id=2, idempotency_key=vigente),
                                 ContextoFalso()).estado == pb2.CUPO_LIBERADO
+
+
+def test_compensar_sin_reserva_no_libera_de_mas_y_bloquea_reserva_tardia(srv, servicio):
+    pb = srv.cupos_pb2
+    owner, unknown = uuid.uuid4().hex, uuid.uuid4().hex
+    servicio.ocuparCupo(pb.OcuparRequest(curso_id=1,idempotency_key=owner),ContextoFalso())
+    before = _libres(srv)
+    for _ in range(2):
+        assert servicio.liberarCupo(pb.LiberarRequest(curso_id=1,idempotency_key=unknown),ContextoFalso()).estado == pb.CUPO_LIBERADO
+        assert _libres(srv) == before
+    with pytest.raises(ContextoFalso.Abortado) as e:
+        servicio.ocuparCupo(pb.OcuparRequest(curso_id=1,idempotency_key=unknown),ContextoFalso())
+    assert 'FAILED_PRECONDITION' in str(e.value.code)
+    assert _libres(srv) == before
+    servicio.liberarCupo(pb.LiberarRequest(curso_id=1,idempotency_key=owner),ContextoFalso())

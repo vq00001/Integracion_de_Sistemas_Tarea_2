@@ -31,6 +31,9 @@ def main() -> int:
         faltantes = {}
         if not any(linea.startswith("MATRICULAS_JWT_SECRET=") for linea in contenido.splitlines()):
             faltantes["MATRICULAS_JWT_SECRET"] = secrets.token_urlsafe(48)
+        for nombre in ("ORCHESTRATOR_API_KEY", "INTERNAL_KEY"):
+            if not any(linea.startswith(nombre+"=") and linea.split("=",1)[1].strip() for linea in contenido.splitlines()):
+                faltantes[nombre] = secrets.token_urlsafe(32)
         if faltantes:
             with destino.open("a", encoding="utf-8") as archivo:
                 if contenido and not contenido.endswith("\n"):
@@ -46,6 +49,8 @@ def main() -> int:
             print(".env ya existe: no se modifica (usa --forzar para regenerarlo).")
         return 0
     valores = {
+        "ORCHESTRATOR_API_KEY": secrets.token_urlsafe(32),
+        "INTERNAL_KEY": secrets.token_urlsafe(32),
         "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),
         "MATRICULAS_JWT_SECRET": secrets.token_urlsafe(48),
         "MATRICULAS_DB_PASSWORD": secrets.token_urlsafe(24),

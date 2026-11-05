@@ -17,6 +17,7 @@ RUN python generar_stubs.py
 
 # Usuario sin privilegios (la API solo escucha el puerto 8000 y habla con Postgres/Cupos por red).
 RUN useradd --system --uid 10001 --no-create-home app
+RUN mkdir -p /data && chown app:app /data
 USER app
 
 EXPOSE 8000

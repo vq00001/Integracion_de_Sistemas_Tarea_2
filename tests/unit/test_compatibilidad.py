@@ -12,8 +12,6 @@ import pytest
 
 from tests.conftest import ROOT
 
-pytest.importorskip("grpc_tools")
-pytest.importorskip("google.protobuf")
 
 _spec = importlib.util.spec_from_file_location("verificar_compatibilidad", ROOT / "scripts" / "verificar_compatibilidad.py")
 vc = importlib.util.module_from_spec(_spec)
@@ -44,7 +42,7 @@ def test_el_proto_actual_es_compatible_con_la_base(base_proto):
 
 def test_el_openapi_actual_es_compatible_con_la_base(base_api, actual_api):
     errores, _ = vc.comparar_openapi(base_api, actual_api)
-    assert errores == []
+    assert vc.errores_no_autorizados(errores) == []
 
 
 # ---- el verificador detecta rupturas simuladas ----
@@ -82,4 +80,4 @@ def test_agregar_algo_opcional_es_compatible(base_api, actual_api):
     ok = copy.deepcopy(actual_api)
     ok["components"]["schemas"]["EnrollmentCreate"]["properties"]["comentario"] = {"type": "string"}
     errores, _ = vc.comparar_openapi(base_api, ok)
-    assert errores == []
+    assert vc.errores_no_autorizados(errores) == []

@@ -10,6 +10,7 @@ pandas==3.0.2
 matplotlib==3.10.8
 # Pruebas unitarias en proceso de la API (tests/unit): mismas versiones que matriculas-api
 fastapi==0.141.1
+uvicorn==0.53.0
 httpx==0.28.1
 sqlalchemy==2.0.54
 pydantic==2.13.5

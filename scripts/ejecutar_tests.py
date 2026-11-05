@@ -32,8 +32,10 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-SERVICIOS = ["matriculas-api", "cupos", "matriculas-db"]
+SERVICIOS = ["gateway", "orquestador", "matriculas-api", "cupos", "matriculas-db"]
 CACHES = ("__pycache__", ".pytest_cache", ".generated")
 
 
@@ -100,7 +102,15 @@ def main() -> int:
     args, pytest_extra = ap.parse_known_args()
 
     esperar_api()
-    cmd = [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"]
+    from tests.conftest import API_KEY
+    from tests.support.servicios import esperar_catalogo, esperar_cupos
+    try:
+        esperar_cupos(os.getenv("CUPOS_GRPC_ADDR", "localhost:50051"))
+        esperar_catalogo(BASE_URL, API_KEY)
+    except RuntimeError as exc:
+        print(f"Preparación fallida: {exc}", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, "-m", "pytest", "tests", "-q", "-ra", "-p", "no:cacheprovider"]
     if args.rapido:
         cmd += ["-m", "not falla"]
     cmd += pytest_extra

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrículas API",
-    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nLos endpoints de negocio aceptan `X-API-Key` (integraciones existentes) o un JWT local\n`Authorization: Bearer ...` (usuarios). Ambos aplican autorización por propietario:\n\n* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y\n  listar estudiantes y emitir o revocar claves de estudiante.\n* **Estudiante** (API key emitida o token JWT): solo permite\n  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra\n  persona responde `403`; las matrículas ajenas responden `404`.\n\nVer la sección \"Autenticación\" del README. Los intentos de autenticación fallidos se limitan\npor IP (`429` + `Retry-After`) y un estudiante con clave propia tiene un tope de escrituras por minuto.\n\n### Cursos y disponibilidad\n`GET /v1/courses` y `GET /v1/courses/{curso_id}` informan los cupos libres (dato **referencial**,\ncon caché de unos segundos). Quien decide si hay cupo es siempre `POST /v1/enrollments`.\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida). Si la conexión\n  se rechazó (la solicitud nunca salió) no queda nada pendiente y se puede reintentar con\n  una Idempotency-Key nueva o la misma. Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado. Por precaución la\n  matrícula también queda `PENDIENTE` y se concilia.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
-    "version": "1.1.0"
+    "description": "Servicio de Inscripción. Gestiona alumnos e inscripciones locales.\nLa reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción ACTIVA.\nLa misma Idempotency-Key devuelve la inscripción existente; repetir la baja devuelve 200.\n",
+    "version": "2.0.0"
   },
   "paths": {
     "/v1/health": {
@@ -832,7 +832,7 @@
           "Cursos"
         ],
         "summary": "Listar cursos con su disponibilidad (referencial)",
-        "description": "Cursos de Cupos con `cupos_libres`. Con `disponibles=true` solo los que tienen cupos. El dato puede tener hasta `CURSOS_CACHE_TTL_SECONDS` segundos de antigüedad: para reservar, usa `POST /v1/enrollments`.",
+        "description": "Cursos de Cupos con `cupos_libres`. Con `disponibles=true` solo los que tienen cupos. El dato puede tener hasta `CURSOS_CACHE_TTL_SECONDS` segundos de antigüedad: para matricular con reserva, usa `POST /v1/matriculas` en el gateway.",
         "operationId": "listar_cursos_v1_courses_get",
         "security": [
           {
@@ -1056,7 +1056,7 @@
           "Matrículas"
         ],
         "summary": "Matricular a un estudiante en un curso",
-        "description": "Registra la matrícula solo si el curso tiene cupos disponibles según el servicio de Cupos (verificado en tiempo real vía gRPC; consulta y reserva son una sola llamada atómica).\n\n**Idempotencia.** Envía una cabecera `Idempotency-Key` (p. ej. un UUID) para poder reintentar con seguridad: repetir la solicitud con la misma clave devuelve la misma matrícula (cabecera `Idempotent-Replayed: true`) y nunca consume un segundo cupo. Una clave identifica un intento **de ese estudiante**; reutilizarla con otro curso da 422. Repetir la clave de una matrícula ya anulada da 409 `ENROLLMENT_ANNULLED`.\n\n**Resultado incierto (504).** Si Cupos no responde a tiempo, el cupo pudo haberse ocupado. La matrícula queda `PENDIENTE`: reintenta con la misma clave o consulta `GET /v1/enrollments/{id}`. Si no se confirma dentro del TTL, se anula automáticamente y se libera el cupo.",
+        "description": "Inscripción local idempotente. Cupos y Pagos los coordina la saga.",
         "operationId": "matricular_v1_enrollments_post",
         "security": [
           {
@@ -1082,10 +1082,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Identifica este intento para poder reintentarlo sin duplicar el cupo.",
+              "description": "Identifica este intento para reintentarlo sin duplicar la inscripción.",
               "title": "Idempotency-Key"
             },
-            "description": "Identifica este intento para poder reintentarlo sin duplicar el cupo."
+            "description": "Identifica este intento para reintentarlo sin duplicar la inscripción."
           },
           {
             "name": "X-API-Key",
@@ -1126,47 +1126,47 @@
             }
           },
           "401": {
-            "description": "Falta la API key o es inválida",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
+            },
+            "description": "Unauthorized"
           },
           "403": {
-            "description": "Una API key de estudiante solo puede matricular a su propio estudiante",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
+            },
+            "description": "Forbidden"
           },
           "404": {
-            "description": "Estudiante o curso no existen",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
+            },
+            "description": "Not Found"
           },
           "409": {
-            "description": "Ya matriculado, matrícula en proceso, anulada o sin cupos",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
+            },
+            "description": "Conflict"
           },
           "422": {
-            "description": "Datos inválidos o Idempotency-Key reutilizada con otro curso",
+            "description": "Unprocessable Entity",
             "content": {
               "application/json": {
                 "schema": {
@@ -1176,44 +1176,24 @@
             }
           },
           "429": {
-            "description": "Demasiadas operaciones por minuto (clave de estudiante)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
-          },
-          "502": {
-            "description": "Cupos devolvió un error interno",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            },
+            "description": "Too Many Requests"
           },
           "503": {
-            "description": "Cupos no disponible (caído o circuito abierto)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
-            }
-          },
-          "504": {
-            "description": "Cupos no respondió a tiempo: resultado incierto, matrícula PENDIENTE",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            },
+            "description": "Service Unavailable"
           }
         }
       },
@@ -1306,6 +1286,23 @@
             }
           },
           {
+            "name": "client_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Client Key"
+            }
+          },
+          {
             "name": "X-API-Key",
             "in": "header",
             "required": false,
@@ -1371,7 +1368,7 @@
         "tags": [
           "Matrículas"
         ],
-        "summary": "Revertir (anular) una matrícula y liberar el cupo",
+        "summary": "Dar de baja una inscripción (idempotente)",
         "operationId": "revertir_matricula_v1_enrollments__enrollment_id__revert_post",
         "security": [
           {
@@ -1439,37 +1436,7 @@
             },
             "description": "Not Found"
           },
-          "409": {
-            "description": "La matrícula ya estaba anulada o aún está pendiente",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
           "429": {
-            "description": "Demasiadas operaciones por minuto (clave de estudiante)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "El cupo se liberó pero no se pudo guardar; repetir",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "502": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1477,27 +1444,7 @@
                 }
               }
             },
-            "description": "Bad Gateway"
-          },
-          "503": {
-            "description": "Cupos no disponible",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "504": {
-            "description": "Cupos no respondió a tiempo",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            "description": "Too Many Requests"
           },
           "422": {
             "description": "Validation Error",
@@ -1808,7 +1755,7 @@
           "cupos_libres": {
             "type": "integer",
             "title": "Cupos Libres",
-            "description": "Referencial: puede estar desactualizado hasta `CURSOS_CACHE_TTL_SECONDS` segundos. La verdad la decide POST /v1/enrollments."
+            "description": "Referencial: puede estar desactualizado hasta `CURSOS_CACHE_TTL_SECONDS` segundos. La reserva la decide Cupos en la saga."
           }
         },
         "type": "object",

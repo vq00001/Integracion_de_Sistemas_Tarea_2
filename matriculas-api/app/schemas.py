@@ -153,7 +153,7 @@ class CourseOut(BaseModel):
     cupos_totales: int
     cupos_libres: int = Field(
         ..., description="Referencial: puede estar desactualizado hasta `CURSOS_CACHE_TTL_SECONDS` "
-                         "segundos. La verdad la decide POST /v1/enrollments."
+                         "segundos. La reserva la decide Cupos en la saga."
     )
 
 

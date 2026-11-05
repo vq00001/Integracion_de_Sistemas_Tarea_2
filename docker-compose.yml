@@ -12,7 +12,7 @@ services:
       DB_PATH: /data/cupos.db
       SIMULAR_LATENCIA_MS: ${SIMULAR_LATENCIA_MS:-0}  # latencia artificial para pruebas/experimentos
       SIMULAR_LATENCIA_MODO: ${SIMULAR_LATENCIA_MODO:-antes}   # antes | despues (ver experiment/README.md)
-      IDEMPOTENCIA_RETENCION_DIAS: ${IDEMPOTENCIA_RETENCION_DIAS:-30}
+      IDEMPOTENCIA_RETENCION_DIAS: ${IDEMPOTENCIA_RETENCION_DIAS:-0}
     volumes:
       - cupos_data:/data            # BD propia del servicio (T5)
     expose:
@@ -64,8 +64,7 @@ services:
         condition: service_healthy
     profiles: ["legacy"]            # CLI "antes de la integración" (ver README) - no se levanta por defecto
 
-  # API REST pública de Matrículas (Python/FastAPI). Valida disponibilidad
-  # de cupos contra `cupos` vía gRPC antes de confirmar cada matrícula.
+  # Servicio interno de Inscripción. Las consultas de cursos leen Cupos.
   matriculas-api:
     build:
       context: .                    # raíz del monorepo, igual que los demás (necesita proto/)
@@ -77,10 +76,9 @@ services:
       CUPOS_GRPC_TIMEOUT_SECONDS: ${CUPOS_GRPC_TIMEOUT_SECONDS:-2.0}
       CUPOS_CB_FAILURE_THRESHOLD: ${CUPOS_CB_FAILURE_THRESHOLD:-5}
       CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
-      PENDING_TTL_SECONDS: ${PENDING_TTL_SECONDS:-30}
-      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
       # SIN valor por defecto: si falta, `docker compose` se niega a levantar; y si es una clave
       # publica/corta, la API se niega a arrancar. Genera .env con: python scripts/generar_env.py
+      INTERNAL_KEY: ${INTERNAL_KEY:?Ejecuta python scripts/generar_env.py}
       API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
       JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
       JWT_TTL_MINUTES: ${MATRICULAS_JWT_TTL_MINUTES:-60}
@@ -90,11 +88,8 @@ services:
       WRITE_RATE_LIMIT_PER_MINUTE: ${WRITE_RATE_LIMIT_PER_MINUTE:-60}
       CURSOS_CACHE_TTL_SECONDS: ${CURSOS_CACHE_TTL_SECONDS:-5}
       DOCS_ENABLED: ${DOCS_ENABLED:-true}      # false en produccion: no publicar /docs ni /openapi.json
-    ports:
-      # API publica: el unico puerto publicado del sistema. Por defecto SOLO en loopback: la API
-      # habla HTTP en claro (sin TLS). Para exponerla en una red, pon un proxy TLS delante (D5) y
-      # recien entonces API_BIND=0.0.0.0.
-      - "${API_BIND:-127.0.0.1}:8000:8000"
+    expose:
+      - "8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/health', timeout=3).status == 200 else 1)"]
       interval: 5s
@@ -104,8 +99,40 @@ services:
     depends_on:
       matriculas-db:
         condition: service_healthy
-      cupos:
+
+  orquestador:
+    build:
+      context: .
+      dockerfile: matriculas-api/Dockerfile
+    command: ["uvicorn", "app.orchestrator_main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    environment:
+      SAGA_DATABASE_URL: sqlite:////data/sagas.db
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?Ejecuta python scripts/generar_env.py}
+      SERVICE_API_KEY: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+      INTERNAL_KEY: ${INTERNAL_KEY:?Falta INTERNAL_KEY}
+      INSCRIPCION_URL: http://matriculas-api:8000
+      PAGOS_URL: ${PAGOS_URL:-http://pagos:8000}
+      CUPOS_GRPC_TARGET: cupos:50051
+      SAGA_STALE_SECONDS: ${SAGA_STALE_SECONDS:-60}
+      SAGA_RECONCILE_SECONDS: ${SAGA_RECONCILE_SECONDS:-10}
+      SAGA_TIMEOUT_SECONDS: ${SAGA_TIMEOUT_SECONDS:-2}
+    volumes:
+      - sagas_data:/data
+    depends_on:
+      matriculas-api:
         condition: service_healthy
+
+  gateway:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${API_BIND:-127.0.0.1}:8000:80"
+    depends_on:
+      - matriculas-api
+      - orquestador
 
   # ---------------------------------------------------------------------------
   # Ejecutores automáticos (no se levantan con `docker compose up`; solo con `run`)
@@ -134,6 +161,8 @@ services:
     depends_on:
       matriculas-api:
         condition: service_healthy
+      cupos:
+        condition: service_healthy
 
   experimentos:
     profiles: ["experimentos"]
@@ -156,5 +185,6 @@ services:
         condition: service_healthy
 
 volumes:
+  sagas_data:
   cupos_data:
   matriculas_db_data:

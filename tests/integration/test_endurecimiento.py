@@ -109,15 +109,16 @@ def test_dos_estudiantes_pueden_usar_la_misma_idempotency_key_sin_enterarse(api)
                 api.post(f"/v1/enrollments/{r.json()['id']}/revert")
 
 
-def test_repetir_la_clave_de_una_matricula_anulada_da_409_y_no_201(api):
+def test_repetir_clave_anulada_devuelve_la_misma_inscripcion_sin_reactivarla(api):
     est = _alta(api)[0].json()
-    clave = {"Idempotency-Key": str(uuid.uuid4())}
-    cuerpo = {"student_id": est["id"], "curso_id": CURSO_CON_CUPO}
-    m = api.post("/v1/enrollments", json=cuerpo, headers=clave)
-    assert m.status_code == 201
-    assert api.post(f"/v1/enrollments/{m.json()['id']}/revert").status_code == 200
-    r = api.post("/v1/enrollments", json=cuerpo, headers=clave)
-    assert r.status_code == 409 and r.json()["error"]["code"] == "ENROLLMENT_ANNULLED"
+    h = {'Idempotency-Key':str(uuid.uuid4())}
+    body = {'student_id':est['id'],'curso_id':CURSO_CON_CUPO}
+    first=api.post('/v1/enrollments',json=body,headers=h)
+    assert first.status_code == 201
+    api.post(f"/v1/enrollments/{first.json()['id']}/revert")
+    r=api.post('/v1/enrollments',json=body,headers=h)
+    assert r.status_code == 201 and r.json()['estado'] == 'ANULADA'
+    assert r.json()['id'] == first.json()['id']
 
 
 # ---------- Listados: el total se cuenta en la base ----------
