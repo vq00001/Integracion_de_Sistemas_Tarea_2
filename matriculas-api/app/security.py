@@ -40,8 +40,8 @@ STUDENT_KEY_PREFIX = "mat_"
 _limitador_fallos = LimitadorVentana(settings.auth_fail_limit, settings.auth_fail_window_seconds)
 _limitador_escrituras = LimitadorVentana(settings.write_rate_limit_per_minute, 60.0)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v1/auth/token", auto_error=False)
-JWT_ISSUER = "matriculas-api-local"
-JWT_AUDIENCE = "matriculas-api"
+JWT_ISSUER = settings.jwt_issuer
+JWT_AUDIENCE = settings.jwt_audience
 _PASSWORD_ITERATIONS = 310_000
 
 

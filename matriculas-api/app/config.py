@@ -66,6 +66,8 @@ class Settings(BaseSettings):
 
     # Secreto local para firmar JWT (HS256). Se genera junto a API_KEYS en .env.
     jwt_secret: str = ""
+    jwt_issuer: str = "matriculas-api-local"
+    jwt_audience: str = "matriculas-api"
     jwt_ttl_minutes: int = Field(default=60, ge=1, le=1440)
 
     # Vigencia de las claves de estudiante, en días (0 = no caducan). Rotación: al vencer, el

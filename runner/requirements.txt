@@ -1,6 +1,7 @@
 # Dependencias del contenedor que ejecuta pruebas y experimentos (versiones fijas)
 pytest==9.2.0
 requests==2.33.1
+flask==3.0.3
 grpcio==1.84.0
 grpcio-tools==1.84.0
 protobuf==7.36.2

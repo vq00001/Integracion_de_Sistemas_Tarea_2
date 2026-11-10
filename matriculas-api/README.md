@@ -1,4 +1,4 @@
-# Matrículas API (REST, Python/FastAPI)
+ Matrículas API (REST, Python/FastAPI)
 
 API REST pública del sistema de Matrículas de AprendeMás. Gestiona
 estudiantes y sus matrículas, validando en tiempo real la disponibilidad

@@ -82,6 +82,8 @@ services:
       API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
       JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
       JWT_TTL_MINUTES: ${MATRICULAS_JWT_TTL_MINUTES:-60}
+      JWT_ISSUER: ${JWT_ISSUER:-matriculas-api-local}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-matriculas-api}
       STUDENT_KEY_TTL_DAYS: ${STUDENT_KEY_TTL_DAYS:-90}
       AUTH_FAIL_LIMIT: ${AUTH_FAIL_LIMIT:-20}
       AUTH_FAIL_WINDOW_SECONDS: ${AUTH_FAIL_WINDOW_SECONDS:-60}
@@ -117,22 +119,70 @@ services:
       SAGA_STALE_SECONDS: ${SAGA_STALE_SECONDS:-60}
       SAGA_RECONCILE_SECONDS: ${SAGA_RECONCILE_SECONDS:-10}
       SAGA_TIMEOUT_SECONDS: ${SAGA_TIMEOUT_SECONDS:-2}
+      SAGA_RETRIES: ${SAGA_RETRIES:-3}
+      SAGA_BACKOFF_SECONDS: ${SAGA_BACKOFF_SECONDS:-0.1}
+      SAGA_BULKHEAD: ${SAGA_BULKHEAD:-8}
+      SAGA_CB_THRESHOLD: ${SAGA_CB_THRESHOLD:-5}
+      SAGA_CB_RECOVERY_SECONDS: ${SAGA_CB_RECOVERY_SECONDS:-15}
     volumes:
       - sagas_data:/data
     depends_on:
+      cupos:
+        condition: service_healthy
       matriculas-api:
         condition: service_healthy
 
-  gateway:
-    image: nginx:alpine
+  # Backend for frontend: compone cursos + matrículas para el portal web.
+  bff:
+    build:
+      context: .
+      dockerfile: bff/Dockerfile
     restart: unless-stopped
-    volumes:
-      - ./gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
-    ports:
-      - "${API_BIND:-127.0.0.1}:8000:80"
+    environment:
+      INSCRIPCION_SERVICE_URL: http://matriculas-api:8000
+      CUPOS_GRPC_TARGET: cupos:50051
+      BFF_UPSTREAM_TIMEOUT_SECONDS: ${BFF_UPSTREAM_TIMEOUT_SECONDS:-4}
+      BFF_MAX_WORKERS: ${BFF_MAX_WORKERS:-16}
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     depends_on:
-      - matriculas-api
-      - orquestador
+      cupos:
+        condition: service_healthy
+      matriculas-api:
+        condition: service_healthy
+
+  # Único punto de entrada publicado: verifica JWT/API keys y limita por identidad.
+  gateway:
+    build:
+      context: ./api-gateway
+    restart: unless-stopped
+    environment:
+      INSCRIPCION_SERVICE_URL: http://matriculas-api:8000
+      ORCHESTRATOR_SERVICE_URL: http://orquestador:8000
+      BFF_SERVICE_URL: http://bff:8090
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
+      MATRICULAS_JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
+      JWT_ISSUER: ${JWT_ISSUER:-matriculas-api-local}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-matriculas-api}
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?Falta ORCHESTRATOR_API_KEY - ejecuta `python scripts/generar_env.py`}
+      GATEWAY_RATE_LIMIT: ${GATEWAY_RATE_LIMIT:-120}
+      GATEWAY_RATE_WINDOW_SECONDS: ${GATEWAY_RATE_WINDOW_SECONDS:-60}
+      GATEWAY_PROXY_TIMEOUT_SECONDS: ${GATEWAY_PROXY_TIMEOUT_SECONDS:-30}
+    ports:
+      - "${API_BIND:-127.0.0.1}:8000:8080"
+    depends_on:
+      matriculas-api:
+        condition: service_healthy
+      orquestador:
+        condition: service_started
+      bff:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # Ejecutores automáticos (no se levantan con `docker compose up`; solo con `run`)

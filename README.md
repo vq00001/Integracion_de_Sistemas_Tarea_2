@@ -1,4 +1,4 @@
-# Tarea 1 — Integración de Sistemas
+# Tarea 2 — Integración de Sistemas
 
 ## Descripción
 
@@ -57,12 +57,20 @@ La integración se implementa en `matriculas-api/`, una API REST desarrollada co
         └── cli/
 ```
 
+La capa de exposición vive en `api-gateway/` y `bff/`: el gateway es el único servicio publicado,
+valida JWT de usuario o API keys M2M, aplica rate limiting y enruta hacia los servicios internos. El
+BFF web agrega el catálogo de cursos y las matrículas para el portal. El contrato está en
+[`docs/gateway-bff.md`](docs/gateway-bff.md).
+
 ### Responsabilidades y persistencia
 
 | Componente | Tecnología | Responsabilidad |
 |---|---|---|
+| API Gateway | Python y Flask | Único punto HTTP publicado; valida JWT/API key, aplica rate limit y enruta solicitudes. |
+| BFF web | Python y Flask | Compone cursos de Cupos e inscripciones de `matriculas-api` para el portal. |
 | Cupos | Python, gRPC y SQLite | Catálogo de cursos, disponibilidad y operaciones sobre cupos. |
 | Matrículas API | Python y FastAPI | API REST, autenticación, matrícula y comunicación resiliente con Cupos. |
+| Orquestador | Python y FastAPI | Coordina la Saga persistente de cupo, pago e inscripción con compensaciones. |
 | Base de datos de Matrículas | PostgreSQL | Persistencia de estudiantes y matrículas. |
 | Matrículas legado | Node.js | Sistema de referencia que representa el estado anterior a la integración. |
 
@@ -88,11 +96,11 @@ python scripts/generar_env.py
 docker compose up --build -d
 ```
 
-El primer comando genera `.env` con claves aleatorias sin sobrescribir un archivo existente. El segundo inicia Cupos, PostgreSQL y la API de Matrículas.
+El primer comando genera `.env` con claves aleatorias sin sobrescribir un archivo existente. El segundo inicia Cupos, PostgreSQL, `matriculas-api`, el orquestador de Saga, el BFF y el gateway. Solo el gateway publica el puerto `8000`; los servicios de dominio quedan dentro de la red de Compose.
 
-La API está disponible en `http://localhost:8000` y su documentación interactiva en `http://localhost:8000/docs`. Los endpoints, parámetros y ejemplos de autenticación están detallados en [`matriculas-api/README.md`](matriculas-api/README.md).
+El gateway está disponible en `http://localhost:8000`. `GET /v1/bff/dashboard` devuelve cursos disponibles e inscripciones en una respuesta. La operación Saga se expone en `POST /v1/matriculas` y su consulta en `GET /v1/sagas/{id}`. Las rutas y ejemplos de autenticación están descritos en [`docs/gateway-bff.md`](docs/gateway-bff.md) y [`matriculas-api/README.md`](matriculas-api/README.md).
 
-El puerto `8000` se publica únicamente en `127.0.0.1` mediante `API_BIND`. Como el servicio utiliza HTTP sin TLS, debe ubicarse detrás de un proxy TLS si se necesita acceso desde otra red. La documentación interactiva puede desactivarse con `DOCS_ENABLED=false`.
+El puerto `8000` se publica únicamente en `127.0.0.1` mediante `API_BIND`. Como el gateway utiliza HTTP sin TLS, debe ubicarse detrás de un proxy TLS si se necesita acceso desde otra red. La documentación interactiva puede desactivarse con `DOCS_ENABLED=false`. Los límites, timeouts y demás valores del gateway y el BFF están en `.env.example`.
 
 Cupos (gRPC) y PostgreSQL permanecen en la red interna de Docker. Para acceder a PostgreSQL:
 

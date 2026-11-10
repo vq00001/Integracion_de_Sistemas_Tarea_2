@@ -25,26 +25,33 @@ def main() -> int:
 
     destino, plantilla = ROOT / ".env", ROOT / ".env.example"
     if destino.exists() and not args.forzar:
-        contenido = destino.read_text(encoding="utf-8")
-        # Al agregar variables nuevas de autenticación, completa instalaciones existentes sin
-        # rotar API_KEYS ni la contraseña de PostgreSQL que ya está en uso.
-        faltantes = {}
-        if not any(linea.startswith("MATRICULAS_JWT_SECRET=") for linea in contenido.splitlines()):
-            faltantes["MATRICULAS_JWT_SECRET"] = secrets.token_urlsafe(48)
-        for nombre in ("ORCHESTRATOR_API_KEY", "INTERNAL_KEY"):
-            if not any(linea.startswith(nombre+"=") and linea.split("=",1)[1].strip() for linea in contenido.splitlines()):
-                faltantes[nombre] = secrets.token_urlsafe(32)
-        if faltantes:
-            with destino.open("a", encoding="utf-8") as archivo:
-                if contenido and not contenido.endswith("\n"):
-                    archivo.write("\n")
-                for nombre, valor in faltantes.items():
-                    archivo.write(f"{nombre}={valor}\n")
+        lineas = destino.read_text(encoding="utf-8").splitlines()
+        secretos = {
+            "MATRICULAS_DB_PASSWORD": secrets.token_urlsafe(24),
+            "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),
+            "ORCHESTRATOR_API_KEY": secrets.token_urlsafe(32),
+            "INTERNAL_KEY": secrets.token_urlsafe(32),
+            "MATRICULAS_JWT_SECRET": secrets.token_urlsafe(48),
+        }
+        modificada = False
+        for nombre, valor in secretos.items():
+            indices = [i for i, linea in enumerate(lineas) if linea.startswith(nombre + "=")]
+            if indices:
+                # Completa solo valores vacíos: conserva toda credencial ya configurada.
+                indice = indices[-1]
+                if not lineas[indice].split("=", 1)[1].strip():
+                    lineas[indice] = f"{nombre}={valor}"
+                    modificada = True
+            else:
+                lineas.append(f"{nombre}={valor}")
+                modificada = True
+        if modificada:
+            destino.write_text("\n".join(lineas) + "\n", encoding="utf-8")
             try:
                 destino.chmod(0o600)
             except OSError:
                 pass
-            print(".env existente: se agregaron variables nuevas sin cambiar las credenciales guardadas.")
+            print(".env existente: se completaron credenciales vacías o faltantes sin cambiar las ya configuradas.")
         else:
             print(".env ya existe: no se modifica (usa --forzar para regenerarlo).")
         return 0
