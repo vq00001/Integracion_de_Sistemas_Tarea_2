@@ -229,9 +229,6 @@ def test_control_el_circuito_abre_con_cinco_cobros_fallidos_seguidos(m):
     assert not cliente.available
 
 
-@pytest.mark.xfail(strict=True, reason="Hallazgo abierto: la compensación exitosa (reembolso) reinicia el contador de fallas "
-                                       "del breaker COBRAR, así que con la saga real el circuito del orquestador hacia Pagos "
-                                       "nunca abre. Al corregirlo, esta prueba pasa y debe quitarse el xfail.")
 def test_el_circuito_del_cobro_abre_aunque_cada_falla_vaya_seguida_de_un_reembolso_exitoso(m):
     sc = importlib.import_module("app.saga_clients")
     cliente = _cliente_que_falla(sc)
