@@ -1,11 +1,14 @@
-"""H4, fase RED: deadline total y recuperación de los workers del BFF.
+"""Regresiones H4: deadline total y recuperación de los workers del BFF.
 
 Flask, ThreadPoolExecutor y el cliente HTTP productivos; servidor HTTP local que
-entrega el cuerpo poco a poco, sin superar el timeout de inactividad de requests.
-Cupos es un doble que respeta el deadline recibido. No requiere Docker ni stubs
-generados. Las esperas externas de 3 s son watchdogs; los límites del BFF se
+entrega el cuerpo poco a poco, sin superar el timeout de inactividad de HTTP.
+Cupos es un servidor gRPC local controlado, con stubs generados temporalmente.
+No requiere Docker. Las esperas externas de 3 s son watchdogs; los límites del BFF se
 comprueban aparte, con margen de scheduling. Sin xfail ni skips.
 """
+import importlib
+import runpy
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -14,9 +17,9 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
-import requests
+import httpx
 
-from tests.integration.test_gateway_bff import bff  # noqa: F401
+from tests.integration.test_gateway_bff import ROOT, bff  # noqa: F401
 
 
 BUDGET = 0.6
@@ -32,28 +35,64 @@ def _configuracion_h4(monkeypatch):
     monkeypatch.setenv('BFF_MAX_WORKERS', '2')
 
 
-class DeadlineExceeded(grpc.RpcError):
-    def code(self):
-        return grpc.StatusCode.DEADLINE_EXCEEDED
+@pytest.fixture(scope='module')
+def proto(tmp_path_factory):
+    folder = tmp_path_factory.mktemp('h4-grpc')
+    runpy.run_path(str(ROOT / 'bff/generar_stubs.py'))['generar'](folder / 'h4_grpc_stubs')
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(folder))
+        try:
+            yield (importlib.import_module('h4_grpc_stubs.cupos_pb2'),
+                   importlib.import_module('h4_grpc_stubs.cupos_pb2_grpc'))
+        finally:
+            for name in list(sys.modules):
+                if name == 'h4_grpc_stubs' or name.startswith('h4_grpc_stubs.'):
+                    sys.modules.pop(name)
 
 
 @pytest.fixture
-def servicios(bff, monkeypatch):
+def servicios(bff, monkeypatch, proto):
+    pb, rpc = proto
     state = SimpleNamespace(
-        bff=bff, slow_rpc=False, slow_http=False,
+        bff=bff, slow_rpc=False, slow_http=False, slow_headers=False, drop_http=False,
         rpc_started=threading.Event(), rpc_release=threading.Event(),
         http_started=threading.Event(), http_release=threading.Event(),
+        rpc_finished=threading.Event(), rpc_cancelled=threading.Event(),
+        http_disconnected=threading.Event(),
         lock=threading.Lock(), calls=[],
     )
 
-    def courses(_request, *, timeout):
-        with state.lock:
-            state.calls.append(('grpc', timeout))
-        state.rpc_started.set()
-        if state.slow_rpc and not state.rpc_release.wait(timeout):
-            raise DeadlineExceeded()
-        return SimpleNamespace(cursos=[SimpleNamespace(
-            curso_id=7, nombre='Redes', cupos_totales=20, cupos_libres=4)])
+    class Cupos(rpc.CuposServicer):
+        def listarCursosDisponibles(self, request, context):
+            state.rpc_started.set()
+            cancelled = threading.Event()
+            def stopped():
+                cancelled.set()
+                state.rpc_cancelled.set()
+            context.add_callback(stopped)
+            try:
+                if state.slow_rpc:
+                    while not state.rpc_release.wait(0.01):
+                        if cancelled.is_set():
+                            return pb.ListarCursosResponse()
+                return pb.ListarCursosResponse(cursos=[pb.Curso(
+                    curso_id=7, nombre='Redes', cupos_totales=20, cupos_libres=4)])
+            finally:
+                state.rpc_finished.set()
+
+    rpc_pool = ThreadPoolExecutor(max_workers=2)
+    grpc_server = grpc.server(rpc_pool)
+    rpc.add_CuposServicer_to_server(Cupos(), grpc_server)
+    port = grpc_server.add_insecure_port('127.0.0.1:0')
+    grpc_server.start()
+    channel = grpc.insecure_channel(f'127.0.0.1:{port}')
+    stub = rpc.CuposStub(channel)
+
+    class RecordingRpc:
+        def future(self, request, *, timeout):
+            with state.lock:
+                state.calls.append(('grpc', timeout))
+            return stub.listarCursosDisponibles.future(request, timeout=timeout)
 
     class Enrollments(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -62,6 +101,25 @@ def servicios(bff, monkeypatch):
         def do_GET(self):
             with state.lock:
                 state.calls.append(('http', self.path, dict(self.headers)))
+            if state.drop_http:
+                assert state.rpc_started.wait(3)
+                state.http_started.set()
+                self.close_connection = True
+                return
+            if state.slow_headers:
+                try:
+                    self.wfile.write(b'HTTP/1.0 200 OK\r\nX-Slow: ')
+                    self.wfile.flush()
+                    state.http_started.set()
+                    while not state.http_release.wait(0.02):
+                        self.wfile.write(b'x')
+                        self.wfile.flush()
+                    self.wfile.write(b'\r\nContent-Length: ' + str(len(ENROLLMENTS)).encode()
+                                     + b'\r\nContent-Type: application/json\r\n\r\n' + ENROLLMENTS)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    state.http_disconnected.set()
+                return
             slow = state.slow_http
             # JSON válido seguido de espacios: el receptor debe leer todo el
             # Content-Length. Cada byte llega antes de su timeout de lectura.
@@ -86,13 +144,14 @@ def servicios(bff, monkeypatch):
                 self.wfile.write(payload[sent:])
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass  # El cliente cerró el transporte al vencer su presupuesto.
+                state.http_disconnected.set()
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Enrollments)
     worker = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
     worker.start()
     monkeypatch.setattr(bff, 'MATRICULAS_API_URL', f'http://127.0.0.1:{server.server_port}')
-    monkeypatch.setattr(bff, 'CUPOS_STUB', SimpleNamespace(listarCursosDisponibles=courses))
+    monkeypatch.setattr(bff, 'cupos_pb2', pb)
+    monkeypatch.setattr(bff, 'CUPOS_STUB', SimpleNamespace(listarCursosDisponibles=RecordingRpc()))
     try:
         yield state
     finally:
@@ -101,6 +160,9 @@ def servicios(bff, monkeypatch):
         server.shutdown()
         server.server_close()
         worker.join(timeout=3)
+        channel.close()
+        grpc_server.stop(0).wait(timeout=3)
+        rpc_pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _dashboard(bff, headers=None):
@@ -160,6 +222,7 @@ def test_h4_timeout_libera_workers_aunque_http_siga_entregando_bytes(servicios):
     assert not s.http_release.is_set()
     assert _capacidad_completa_disponible(s.bff._pool), (
         'Tras el 504 sigue ocupado un worker: cancelar el futuro no terminó la llamada HTTP')
+    assert s.http_disconnected.wait(RECOVERY_MARGIN), 'El cliente no cerró el transporte HTTP'
     s.slow_rpc = s.slow_http = False
     recovered = _dashboard(s.bff)
     assert recovered.status_code == 200, recovered.json
@@ -171,15 +234,11 @@ def test_h4_timeout_de_transporte_deja_margen_al_deadline_de_agregacion(servicio
     s = servicios
     http_timeouts = []
 
-    def get(_url, **kwargs):
+    async def get(_client, _url, **kwargs):
         http_timeouts.append(kwargs.get('timeout'))
-        response = requests.Response()
-        response.status_code = 200
-        response._content = ENROLLMENTS
-        response._content_consumed = True
-        return response
+        return httpx.Response(200, content=ENROLLMENTS)
 
-    monkeypatch.setattr(s.bff.requests, 'get', get)
+    monkeypatch.setattr(s.bff.httpx.AsyncClient, 'get', get)
     response = _dashboard(s.bff)
     assert response.status_code == 200
     with s.lock:
@@ -237,3 +296,78 @@ def test_h4_control_agregacion_sana_conserva_datos_y_credenciales(servicios):
     assert headers['Authorization'] == 'Bearer alumno-test'
     assert headers['X-API-Key'] == 'm2m-test'
     assert 'X-Ignore' not in headers
+
+
+def test_h4_deadline_cancela_http_tambien_durante_cabeceras_lentas(servicios):
+    s = servicios
+    s.slow_headers = True
+    start = time.monotonic()
+    response = _dashboard(s.bff)
+    elapsed = time.monotonic() - start
+    assert response.status_code == 504
+    assert elapsed <= BUDGET + SCHEDULING_MARGIN
+    assert s.http_started.is_set() and not s.http_release.is_set()
+    assert _capacidad_completa_disponible(s.bff._pool)
+
+
+def test_h4_falla_http_rapida_cancela_rpc_en_curso_y_recupera_capacidad(servicios):
+    s = servicios
+    s.slow_rpc, s.drop_http = True, True
+    response = _dashboard(s.bff)
+    assert response.status_code == 502
+    assert response.json['error']['code'] == 'INSCRIPCION_UNAVAILABLE'
+    assert not s.rpc_release.is_set()
+    assert s.rpc_cancelled.wait(SCHEDULING_MARGIN), 'No se canceló la llamada gRPC en curso'
+    assert s.rpc_finished.wait(SCHEDULING_MARGIN)
+    assert _capacidad_completa_disponible(s.bff._pool)
+    s.slow_rpc = s.drop_http = False
+    assert _dashboard(s.bff).status_code == 200
+
+
+def test_h4_sobrecarga_no_encola_mas_llamadas_y_se_recupera_tras_timeout(servicios):
+    s = servicios
+    s.slow_rpc = s.slow_http = True
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        original = caller.submit(_dashboard, s.bff)
+        assert s.rpc_started.wait(3)
+        assert s.http_started.wait(3)
+        with s.lock:
+            before = list(s.calls)
+        overloaded = _dashboard(s.bff)
+        assert overloaded.status_code == 503
+        assert overloaded.json['error']['code'] == 'BFF_OVERLOADED'
+        assert int(overloaded.headers['Retry-After']) >= 1
+        assert s.bff.app.test_client().get('/health').status_code == 200
+        with s.lock:
+            assert s.calls == before, 'La sobrecarga inició nuevas llamadas a dependencias'
+        assert original.result(timeout=3).status_code == 504
+    assert _capacidad_completa_disponible(s.bff._pool)
+    s.slow_rpc = s.slow_http = False
+    assert _dashboard(s.bff).status_code == 200
+
+
+def test_h4_admision_se_libera_cuando_termina_el_trabajo_no_solo_al_responder(servicios, monkeypatch):
+    s = servicios
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def non_cooperative(*args):
+        calls.append(args)
+        started.set()
+        assert release.wait(3)
+        return httpx.Response(200, content=ENROLLMENTS)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(s.bff, 'BFF_TIMEOUT', 0.05)
+        patch.setattr(s.bff, '_get', non_cooperative)
+        try:
+            assert _dashboard(s.bff).status_code == 504
+            assert started.is_set()
+            # Cancelar un Future no detiene este doble deliberadamente hostil.
+            # El BFF debe contenerlo sin admitir más trabajo sobre su capacidad.
+            assert _dashboard(s.bff).status_code == 503
+            assert len(calls) == 1
+        finally:
+            release.set()
+        assert _capacidad_completa_disponible(s.bff._pool)
+    assert _dashboard(s.bff).status_code == 200

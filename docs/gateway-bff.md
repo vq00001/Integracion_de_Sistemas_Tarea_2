@@ -20,8 +20,27 @@
 El BFF llama en paralelo al RPC `listarCursosDisponibles` de Cupos por gRPC y a
 `GET /v1/enrollments?limit=100` de Inscripción por REST. Así compone datos de dos servicios de
 dominio distintos. Reenvía el Bearer JWT o API key a Inscripción, para que el servicio mantenga sus
-controles de autorización y alcance por estudiante. Si una dependencia excede
-`BFF_UPSTREAM_TIMEOUT_SECONDS`, responde `504`.
+controles de autorización y alcance por estudiante.
+
+`BFF_UPSTREAM_TIMEOUT_SECONDS` es el presupuesto total de la agregación, medido
+con un único deadline monotónico desde la entrada al dashboard. Incluye el tiempo
+de cola y la espera de ambos resultados; no se reinicia al pasar de Cupos a
+Inscripción. Al vencer responde `504` con código `BFF_DEPENDENCY_TIMEOUT`.
+
+Cada transporte recibe como timeout el 80 % del tiempo restante. Además, HTTP
+usa `httpx.AsyncClient` bajo `asyncio.timeout` para limitar la operación completa,
+incluidos redirecciones, cabeceras y cuerpo. Así, una respuesta que envía bytes
+continuamente no puede prolongar la llamada reiniciando el timeout de lectura.
+El BFF cancela la tarea HTTP y el RPC nativo de gRPC cuando vence el presupuesto
+o falla la otra dependencia. `Future.cancel()` se usa únicamente para evitar
+que comiencen los trabajos que aún estén en cola.
+
+`BFF_MAX_WORKERS` acota el pool (mínimo 2). Se admiten como máximo
+`floor(BFF_MAX_WORKERS / 2)` agregaciones simultáneas por proceso, reservando dos
+workers por dashboard. Sin capacidad se responde `503`, código `BFF_OVERLOADED`
+y `Retry-After: 1`, sin iniciar nuevas llamadas. El permiso se devuelve cuando
+ambos trabajos realmente terminan, aunque el dashboard ya haya respondido con
+error. `/health` no utiliza ese pool. Estos límites no se comparten entre réplicas.
 
 Para una Saga iniciada con JWT, el gateway exige que `alumno_id` sea el `sub` del token y oculta
 con `404` las sagas que pertenecen a otro estudiante. La API key M2M permite operaciones de
@@ -71,3 +90,17 @@ Los valores configurables están en `.env.example`:
 El servicio Pagos está en [`../pagos/`](../pagos/README.md) (Transbank Webpay Plus). El gateway solo enruta hacia él las dos rutas
 públicas del comprador; su API de servicio (`/v1/payments…`) y `/internal` nunca se exponen. Variables: `PAGOS_SERVICE_URL`
 (gateway), `PAGOS_API_KEY`, `PAGOS_CALLBACK_KEY`, `PAGOS_PUBLIC_BASE_URL`, `TBK_*` y `PAGOS_TTL_SECONDS`; contrato en [`saga.md`](saga.md).
+
+## Verificación de H4
+
+```bash
+python -m pytest tests/integration/test_h4_bff_deadline.py tests/integration/test_gateway_bff.py -q --tb=short
+docker compose up -d --build bff
+```
+
+Las pruebas usan HTTP y gRPC locales con los clientes reales. Comprueban el plazo
+total, cancelación durante cabeceras y cuerpo lentos, liberación de ambos workers,
+cancelación del RPC ante una falla HTTP, rechazo de sobrecarga, recuperación e
+integridad de datos y credenciales. Generan los stubs en una carpeta temporal;
+no necesitan Docker ni modifican las bases existentes. No requieren variables
+nuevas. El rebuild instala el cliente HTTP indicado en `bff/requirements.txt`.

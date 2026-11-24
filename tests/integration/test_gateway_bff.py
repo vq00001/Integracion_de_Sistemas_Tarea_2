@@ -292,12 +292,12 @@ def test_bff_dashboard_composes_parallel_course_and_enrollment_results(bff, monk
             events.append(("courses", time.monotonic()))
         return {"items": [{"curso_id": 4, "nombre": "Redes", "cupos_totales": 20, "cupos_libres": 7}]}
 
-    def enrollments(path, headers):
+    def enrollments(path, headers, budget):
         with lock:
             events.append(("enrollments", time.monotonic()))
         assert path == "/v1/enrollments?limit=100"
         assert headers == {"Authorization": "Bearer user-token", "X-API-Key": "secondary"}
-        return types.SimpleNamespace(ok=True, json=lambda: {"items": [{"id": "e1"}], "total": 1})
+        return types.SimpleNamespace(is_error=False, json=lambda: {"items": [{"id": "e1"}], "total": 1})
 
     monkeypatch.setattr(bff, "_cursos_disponibles", courses)
     monkeypatch.setattr(bff, "_get", enrollments)
@@ -314,18 +314,18 @@ def test_bff_dashboard_composes_parallel_course_and_enrollment_results(bff, monk
 
 def test_bff_starts_course_and_enrollment_dependencies_concurrently(bff, monkeypatch):
     rendezvous = threading.Barrier(2)
-    monkeypatch.setattr(bff, "_cursos_disponibles", lambda: (rendezvous.wait(timeout=2), {"items": []})[1])
+    monkeypatch.setattr(bff, "_cursos_disponibles", lambda budget: (rendezvous.wait(timeout=2), {"items": []})[1])
     monkeypatch.setattr(bff, "_get", lambda *args: (rendezvous.wait(timeout=2), types.SimpleNamespace(
-        ok=True, json=lambda: {"items": [], "total": 0},
+        is_error=False, json=lambda: {"items": [], "total": 0},
     ))[1])
     response = bff.app.test_client().get("/v1/bff/dashboard")
     assert response.status_code == 200
 
 
 def test_bff_reports_enrollment_http_error_with_upstream_status(bff, monkeypatch):
-    monkeypatch.setattr(bff, "_cursos_disponibles", lambda: {"items": []})
+    monkeypatch.setattr(bff, "_cursos_disponibles", lambda budget: {"items": []})
     monkeypatch.setattr(bff, "_get", lambda *args: types.SimpleNamespace(
-        ok=False, status_code=403, json=lambda: {"detail": "forbidden"},
+        is_error=True, status_code=403, json=lambda: {"detail": "forbidden"},
     ))
     response = bff.app.test_client().get("/v1/bff/dashboard")
     assert response.status_code == 403
@@ -338,10 +338,10 @@ def test_bff_reports_enrollment_http_error_with_upstream_status(bff, monkeypatch
     ("unavailable", 502, "INSCRIPCION_UNAVAILABLE"),
 ])
 def test_bff_maps_enrollment_dependency_failures(bff, monkeypatch, failure, status, code):
-    import requests
+    import httpx
 
-    monkeypatch.setattr(bff, "_cursos_disponibles", lambda: {"items": []})
-    error = requests.Timeout if failure == "timeout" else requests.ConnectionError
+    monkeypatch.setattr(bff, "_cursos_disponibles", lambda budget: {"items": []})
+    error = httpx.ReadTimeout('timeout') if failure == "timeout" else httpx.ConnectError('unavailable')
     monkeypatch.setattr(bff, "_get", Mock(side_effect=error))
     response = bff.app.test_client().get("/v1/bff/dashboard")
     assert response.status_code == status
@@ -351,11 +351,11 @@ def test_bff_maps_enrollment_dependency_failures(bff, monkeypatch, failure, stat
 def test_bff_returns_gateway_timeout_when_dependency_exceeds_budget(bff, monkeypatch):
     release = threading.Event()
     bff.BFF_TIMEOUT = 0.01
-    monkeypatch.setattr(bff, "_cursos_disponibles", lambda: {"items": []})
+    monkeypatch.setattr(bff, "_cursos_disponibles", lambda budget: {"items": []})
 
     def slow_enrollments(*args):
         release.wait(timeout=2)
-        return types.SimpleNamespace(ok=True, json=lambda: {"items": [], "total": 0})
+        return types.SimpleNamespace(is_error=False, json=lambda: {"items": [], "total": 0})
 
     monkeypatch.setattr(bff, "_get", slow_enrollments)
     try:
