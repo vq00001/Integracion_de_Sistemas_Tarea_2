@@ -148,12 +148,19 @@ def metrics():
             lines.append(f'sagas_total{{estado="{state}"}} {count}')
         count = db.scalar(select(func.count()).select_from(SagaStep).where(SagaStep.tipo == "compensacion", SagaStep.estado == "OK"))
         lines.append(f'compensaciones_total {count}')
+    with orchestrator.metrics_lock:
+        lines.append(f'saga_admision_rechazos_total {orchestrator.admission_rejected}')
     for name, client in orchestrator.clients.items():
         # La serie histórica mantiene su significado: admisión de pasos forward.
         forward_state = client.breaker.state.value
         for state in ("CLOSED", "OPEN", "HALF_OPEN"):
             lines.append(f'circuito_estado{{dependencia="{name}",estado="{state}"}} {int(forward_state == state)}')
+        with client.lock:
+            attempts, in_flight = dict(client.attempts), dict(client.in_flight)
         for operation, breaker in client.breakers.items():
+            labels = f'dependencia="{name}",operacion="{operation}"'
+            lines.append(f'saga_dependencia_intentos_total{{{labels}}} {attempts[operation]}')
+            lines.append(f'saga_dependencia_en_vuelo{{{labels}}} {in_flight[operation]}')
             operation_state = breaker.state.value
             for state in ("CLOSED", "OPEN", "HALF_OPEN"):
                 lines.append(f'saga_circuito_operacion_estado{{dependencia="{name}",operacion="{operation}",estado="{state}"}} {int(operation_state == state)}')

@@ -64,7 +64,7 @@ def test_parseo_de_metricas_del_orquestador(exp):
 def test_plan_de_fases_y_variantes(exp):
     for rapido in (True, False):
         fases = exp.plan(rapido)
-        assert [f.nombre for f in fases] == ["antes", "lenta", "alivio", "bulkhead", "pico", "caida", "recuperacion"]
+        assert [f.nombre for f in fases] == ["antes", "pagos_lento", "pagos_recuperacion", "lenta", "alivio", "bulkhead", "pico", "caida", "recuperacion"]
         assert next(f for f in fases if f.nombre == "bulkhead").destino == "pagos"
         assert next(f for f in fases if f.nombre == "bulkhead").latencia_ms < 1500   # menor que el timeout: aísla el bulkhead
         assert next(f for f in fases if f.nombre == "pico").latencia_ms > 1500       # mayor: timeouts reales
@@ -102,7 +102,7 @@ def _csv_sintetico(raw, ts):
                 for nombre in ("orq_sagas", "ins_enrollments", "pagos_health"):
                     sondas.append(dict(t=t, fase=f, sonda=nombre, codigo=200, latencia_s=0.01, variante=v, rep=1))
                 fila = dict(t=t, fase=f, variante=v, rep=1, orq_ok=1, pagos_ok=1, pagos_cb="OPEN" if (falla and not lento) else "CLOSED",
-                            orq_cb_COBRAR="CLOSED", pagos_bulkhead_rech=i * 5 if f == "bulkhead" and not lento else 0, pagos_circuito_rech=0, pagos_tbk_intentos=i,
+                            orq_cb_COBRAR="CLOSED", pagos_bulkhead_rech=max(0, min(t-6, 2))*25 if not lento else 0, pagos_circuito_rech=0, pagos_tbk_intentos=int(t*5),
                             orq_bulkhead_rech_RESERVAR=0, orq_bulkhead_rech_COBRAR=0, orq_bulkhead_rech_INSCRIBIR=0)
                 for e in ("EN_CURSO", "ESPERANDO_PAGO", "COMPLETADA", "COMPENSANDO", "COMPENSADA", "COMPENSACION_PENDIENTE"):
                     fila[f"orq_sagas_{e}"] = i
@@ -133,4 +133,4 @@ def test_las_figuras_y_el_resumen_se_generan_desde_los_csv(graf, tmp_path, monke
     assert "E1_exito" in resumen and "Bulkhead aislado" in resumen and "cupos huérfanos 0" in resumen
     assert "El circuito Orquestador→Pagos no abrió" in resumen  # el detector del hallazgo se activa con estos datos
     tabla = pd.read_csv(out / "saga_fallas_fases_t1.csv")
-    assert set(tabla["fase"]) == set(graf.FASES) and set(tabla["variante"]) == {"con_patron", "sin_patron"}
+    assert set(tabla["fase"]) == set(graf.FASES) - {"pagos_lento", "pagos_recuperacion"} and set(tabla["variante"]) == {"con_patron", "sin_patron"}

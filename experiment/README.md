@@ -250,13 +250,13 @@ Los experimentos anteriores de esta carpeta miden el flujo de la Tarea 1; este m
 |---|---|---|
 | **E1 Éxito** | 5 matrículas completas (el comprador paga en Webpay simulado) | Estado de Cupos, Inscripción y Pagos antes/después; pasos firmes en orden |
 | **E2 Fallo con compensación** | Falla el último paso (Inscripción) tras pagar | Reembolso, cupo liberado, sin inscripción; orden inverso de la compensación |
-| **E3 Cascada contenida** | Una carga constante atraviesa las fases `antes → lenta → alivio → bulkhead → pico → caída → recuperación` (Transbank lento, pico de carga, caído) | Latencias, estado del circuito, rechazos del bulkhead, intentos reales a Transbank, sagas por estado y **el resto del sistema** (sondas) |
+| **E3 Cascada contenida** | Una carga de bucle cerrado atraviesa `antes → pagos_lento → pagos_recuperacion → lenta → alivio → bulkhead → pico → caida → recuperacion` (Pagos lento, Transbank lento, pico y caída) | Latencias, circuitos por frontera y operación, admisión, bulkhead, intentos reales a Pagos y Transbank, sagas por estado y **el resto del sistema** (sondas) |
 
-E3 se ejecuta dos veces con la misma carga: **con patrón** (configuración normal) y **sin patrón** (Circuit Breaker y Bulkhead inertes, con los mismos timeouts). La sonda `GET /v1/sagas/{id}` comparte proceso con la saga (ahí se ve la cascada), `GET /v1/health` de Pagos comparte proceso con la llamada lenta a Transbank (ahí se ve si el bulkhead protege sus hilos) y `GET /v1/enrollments` es otro servicio (ahí se ve el aislamiento).
+E3 usa el mismo plan de workers, pausas, fallas y timeouts por variante: **con patrón** (configuración normal) y **sin patrón** (Circuit Breaker y Bulkhead inertes, con los mismos timeouts). La sonda `GET /v1/sagas/{id}` comparte proceso con la saga (ahí se ve la cascada), `GET /v1/health` de Pagos comparte proceso con la llamada lenta a Transbank (ahí se ve si el bulkhead protege sus hilos) y `GET /v1/enrollments` es otro servicio (ahí se ve el aislamiento).
 
 ### Cómo ejecutarlo
 
-Corre con procesos locales (Cupos gRPC, Inscripción, Orquestador y Pagos reales; solo Transbank y el comprador simulados), sin Docker ni internet:
+Corre con procesos locales (Cupos gRPC, Inscripción, Orquestador y Pagos reales; Transbank y comprador simulados, más un proxy experimental para demorar crear pagos), sin Docker ni internet:
 
 ```bash
 pip install -r matriculas-api/requirements.txt -r pagos/requirements.txt -r tests/requirements.txt
@@ -269,13 +269,28 @@ Para correrlo por partes con el mismo `--ts` (los CSV se fusionan): `--solo-casc
 
 ### Qué produce
 
+- `data/raw/saga_fallas_<ts>_manifest.json`: revisión Git, estado de trabajo, hash de fuentes y parámetros de ejecución.
+- `data/raw/saga_fallas_<ts>_frontera.csv`: llamadas recibidas y reenviadas por el proxy, con operación, clave opaca y tiempos; no contiene credenciales ni cuerpos.
 - `data/raw/saga_fallas_<ts>_*.csv`: peticiones, sondas, métricas muestreadas cada 0,5 s, fases, estados antes/después por fase y escenarios E1/E2.
 - `results/saga_fallas_cascada_<ts>.png`: línea de tiempo con y sin patrón (latencia, resto del sistema, circuitos y bulkhead, sagas por estado).
 - `results/saga_fallas_fases_<ts>.png|csv|md`: comparación por fase (medianas y rango entre repeticiones).
 - `results/saga_fallas_antes_despues_<ts>.png`: estado de los tres servicios antes/después en E1 y E2.
 - `results/resumen_saga_fallas_<ts>.md`: lectura de la evidencia **con los números de la corrida** y los hallazgos que se detectan en los datos.
 
-Ejecución de referencia incluida en el repositorio: `20261121_completo` (3 repeticiones por variante).
+Evidencia vigente de H6: [`20261124_H6`](results/resumen_saga_fallas_20261124_H6.md), con tres repeticiones por variante y comprador activo. `20261121_completo` queda como evidencia histórica anterior a H2/H3/H6.
+
+Para reproducir la corrida incluida:
+
+```bash
+python experiment/scripts/saga_fallas.py --repeticiones-base 3 --repeticiones 3 --ts <identificador_nuevo>
+python -m pytest tests/unit/test_h6_evidencia_cascada.py tests/unit/test_saga_fallas_experimento.py tests/unit/test_h2_breaker_pagos.py -q
+```
+
+En `pagos_lento`, cuatro workers y una demora de 3000 ms en el proxy superan el timeout del orquestador (2 s), sin agotar la admisión (8). Transbank permanece sano; las compensaciones y consultas no sufren esa demora. El proxy reenvía incluso tras el timeout y registra la petición tardía, para comprobar que la cancelación por clave evita cobros huérfanos. Cada variante usa el mismo proxy.
+
+El comprador aprueba los pagos aceptados. En la fase de carga directa a Pagos se cancela cada pago por su clave; ese trabajo no es una matrícula. El drenaje solo declara cierre cuando no quedan sagas en ejecución, compensaciones pendientes, esperas de comprador, pagos pendientes ni peticiones activas del proxy. Los rechazos `PAGOS_CIRCUITO_ABIERTO` se comprueban por saga: sin pasos firmes y sin peticiones al proxy.
+
+`pct_fail_fast_orq` exige HTTP 503, motivo de circuito de Pagos abierto y respuesta en menos de 200 ms. Se distingue de `pct_rapidas` y de HTTP 429. Los contadores de intentos se incrementan únicamente al ejecutar la dependencia; un rechazo local no cuenta. El informe se detiene si un contador disminuye dentro de una repetición, y no convierte telemetría ausente en ceros.
 
 ### Cómo se lee frente a la rúbrica
 
@@ -285,9 +300,8 @@ Ejecución de referencia incluida en el repositorio: `20261121_completo` (3 repe
 
 ### Límites
 
-Transbank está simulado y la latencia/caída se inducen en Pagos (`PUT /internal/fault`); todo corre en una máquina con SQLite y un proceso por servicio; las matrículas de E3 quedan en `ESPERANDO_PAGO` (miden reserva y cobro pendiente, no la inscripción); las cifras absolutas dependen del equipo, lo que importa es la comparación entre variantes.
+Transbank y el comprador están simulados. La lentitud de Pagos se induce en el proxy y la de Transbank mediante `PUT /internal/fault`. Todo corre en una máquina con SQLite y un proceso por servicio. La carga espera respuesta y comprador/cancelación antes de repetir: no es una tasa fija de llegada. Los volúmenes de trabajo difieren entre variantes y los máximos de ocupación son muestreados; no representan CPU ni capacidad de producción. HALF_OPEN puede pasar entre muestras; su transición controlada se verifica en H2. La recuperación medida exige CLOSED y matrículas completas posteriores. Un resultado con espera de pago o compensación pendiente no demuestra cierre.
 
 ### Evidencia complementaria: integridad y bulkhead con dependencias sanas
 
-`python experiment/scripts/saga_integridad_bulkhead.py` (segundos, sin servicios externos) reproduce dos hallazgos abiertos de la saga y deja CSV y resumen en `data/raw/` y `results/`:
-(A) `POST /v1/enrollments` inscribe sin pasar por la saga (sin cupo ni pago, incluso en un curso inexistente) y (B) con dependencias **sanas**, el bulkhead del orquestador (capacidad 8) compensa matrículas legítimas desde las 12 simultáneas.
+La corrida histórica `20261122_163339` documentó H1 (alta pública sin Saga) y H3 (compensaciones provocadas por el bulkhead). Sus CSV e informe se conservan como diagnóstico previo a las correcciones. La protección vigente se verifica con `tests/integration/test_h1_inscripcion_saga.py` y `tests/unit/test_h3_bulkhead_saga.py`; esa corrida histórica no describe el comportamiento actual.

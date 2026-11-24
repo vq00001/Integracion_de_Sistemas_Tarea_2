@@ -1,0 +1,13 @@
+escenario,saga,estado_final,latencia_solicitud_s,pago_a_estado_final_s,pasos_firmes,invariantes_ok,momento,cupos_ocupados,sagas_EN_CURSO,sagas_ESPERANDO_PAGO,sagas_COMPLETADA,sagas_COMPENSANDO,sagas_COMPENSADA,sagas_COMPENSACION_PENDIENTE,pagos_PENDIENTE,pagos_COBRADO,pagos_REEMBOLSADO,pagos_CANCELADO,pagos_RECHAZADO,pagos_EXPIRADO,pagos_ABORTADO,pagos_PROCESANDO,inscripciones_CONFIRMADA,reembolsos
+E1_exito,1,COMPLETADA,0.1961,0.1862,RESERVAR>COBRAR>INSCRIBIR,1,,,,,,,,,,,,,,,,,,
+E1_exito,2,COMPLETADA,0.0785,0.1701,RESERVAR>COBRAR>INSCRIBIR,1,,,,,,,,,,,,,,,,,,
+E1_exito,3,COMPLETADA,0.0693,0.1724,RESERVAR>COBRAR>INSCRIBIR,1,,,,,,,,,,,,,,,,,,
+E1_exito,,,,,,,antes,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+E1_exito,,,,,,,despues,3,0,0,3,0,0,0,0,3,0,0,0,0,0,0,3,
+E1_exito,,,,,,,reembolsos_en_transbank,,,,,,,,,,,,,,,,,0
+E2_falla_ultimo_paso,1,COMPENSADA,0.2652,0.3153,RESERVAR>COBRAR>comp:INSCRIBIR>comp:COBRAR>comp:RESERVAR,1,,,,,,,,,,,,,,,,,,
+E2_falla_ultimo_paso,2,COMPENSADA,0.0892,0.3073,RESERVAR>COBRAR>comp:INSCRIBIR>comp:COBRAR>comp:RESERVAR,1,,,,,,,,,,,,,,,,,,
+E2_falla_ultimo_paso,3,COMPENSADA,0.077,0.3023,RESERVAR>COBRAR>comp:INSCRIBIR>comp:COBRAR>comp:RESERVAR,1,,,,,,,,,,,,,,,,,,
+E2_falla_ultimo_paso,,,,,,,antes,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+E2_falla_ultimo_paso,,,,,,,despues,0,0,0,0,0,3,0,0,0,3,0,0,0,0,0,0,
+E2_falla_ultimo_paso,,,,,,,reembolsos_en_transbank,,,,,,,,,,,,,,,,,3

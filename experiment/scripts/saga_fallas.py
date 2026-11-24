@@ -6,13 +6,13 @@ Transbank (tests/support/fake_transbank.py) y el comprador están simulados. Mid
 
   E1  Éxito:                       la matrícula completa y los tres pasos quedan firmes.
   E2  Fallo con compensación:      falla el ÚLTIMO paso tras pagar; se reembolsa y se libera el cupo.
-  E3  Falla en cascada contenida:  Transbank lento → alivio → bulkhead → pico de carga → caído → recuperación, con la
+  E3  Falla en cascada contenida:  Pagos lento → recuperación → Transbank lento → alivio → bulkhead → pico de carga → caído → recuperación, con la
                                    misma línea de tiempo en dos variantes:
         con_patron  Circuit Breaker y Bulkhead activos (configuración normal).
         sin_patron  Circuit Breaker y Bulkhead desactivados (umbral y capacidad altísimos): la
                     respuesta a "qué habría pasado SIN el patrón".
 
-En E3 una carga constante de POST /v1/matriculas atraviesa las fases y, en paralelo, dos sondas miden "el
+En E3 una carga de bucle cerrado de POST /v1/matriculas atraviesa las fases y, en paralelo, dos sondas miden "el
 resto del sistema": GET /v1/sagas/{id} (mismo proceso que la saga: ahí se ve la cascada), GET
 /v1/health de Pagos (mismo proceso que la llamada lenta a Transbank: ahí se ve si el bulkhead protege sus hilos) y
 GET /v1/enrollments en Inscripción (otro servicio: ahí se ve el aislamiento). Un muestreador lee /metrics
@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import json
+import hashlib
 import math
 import os
 import queue
@@ -50,7 +52,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -58,6 +60,7 @@ import requests
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tests.support.fake_transbank import FakeTransbank  # noqa: E402
+from experiment.support.pagos_proxy import PagosProxy
 
 PY = sys.executable
 RAW = ROOT / "experiment" / "data" / "raw"
@@ -66,6 +69,7 @@ INTERNAL = "local-internal-testing-key-32-characters"
 ORQ_KEY = "local-orchestrator-testing-key-32-characters"
 PAGOS_KEY = "local-pagos-testing-key-32-characters-xx"
 CALLBACK = "local-callback-testing-key-32-characters"
+WRITER = "local-experiment-writer-key-32-characters"
 TBK_SECRET = "SECRET-DE-PRUEBA"
 ESTADOS_SAGA = ("EN_CURSO", "ESPERANDO_PAGO", "COMPLETADA", "COMPENSANDO", "COMPENSADA", "COMPENSACION_PENDIENTE")
 EN_VUELO = ("EN_CURSO", "COMPENSANDO", "COMPENSACION_PENDIENTE")
@@ -80,22 +84,21 @@ class Fase:
     think: float             # pausa de cada worker entre peticiones
     latencia_ms: int = 0     # latencia inducida en Transbank (> timeout equivale a un timeout real)
     falla: bool = False      # Transbank caído
+    falla_en: str = "transbank"
     destino: str = "matriculas"   # "matriculas" = POST /v1/matriculas (saga completa); "pagos" = POST /v1/payments directo
 
 
 def plan(rapido: bool) -> list[Fase]:
-    """antes → lenta → alivio → bulkhead → pico → caida → recuperacion.
-    · alivio:   Transbank sano para que el circuito se cierre antes de las fases siguientes.
-    · bulkhead: carga DIRECTA a Pagos con Transbank lento pero sin llegar al timeout (1,2 s < 1,5 s): el circuito no
-                se dispara y se aísla el efecto del bulkhead sobre los hilos de Pagos.
-    · pico:     carga a la saga completa con Transbank lento, partiendo con el circuito cerrado."""
-    if rapido:
-        return [Fase("antes", 4, 4, 0.15), Fase("lenta", 6, 4, 0.15, latencia_ms=3000), Fase("alivio", 7, 4, 0.15),
-                Fase("bulkhead", 6, 50, 0.1, latencia_ms=1200, destino="pagos"),
-                Fase("pico", 6, 40, 0.5, latencia_ms=3000), Fase("caida", 4, 4, 0.15, falla=True), Fase("recuperacion", 8, 4, 0.15)]
-    return [Fase("antes", 8, 4, 0.15), Fase("lenta", 10, 4, 0.15, latencia_ms=3000), Fase("alivio", 8, 4, 0.15),
-            Fase("bulkhead", 8, 60, 0.1, latencia_ms=1200, destino="pagos"),
-            Fase("pico", 10, 60, 0.5, latencia_ms=3000), Fase("caida", 8, 4, 0.15, falla=True), Fase("recuperacion", 12, 4, 0.15)]
+    """Aísla primero la lentitud de Pagos y luego la de Transbank; recupera ambas."""
+    return [Fase("antes", 3 if rapido else 4, 4, 0.15),
+            Fase("pagos_lento", 7 if rapido else 10, 4, 0.15, latencia_ms=3000, falla_en="pagos"),
+            Fase("pagos_recuperacion", 7 if rapido else 8, 4, 0.15),
+            Fase("lenta", 6 if rapido else 8, 4, 0.15, latencia_ms=3000),
+            Fase("alivio", 7 if rapido else 8, 4, 0.15),
+            Fase("bulkhead", 4 if rapido else 6, 24, 0.2, latencia_ms=1200, destino="pagos"),
+            Fase("pico", 6 if rapido else 8, 16, 0.3, latencia_ms=3000),
+            Fase("caida", 3 if rapido else 4, 4, 0.15, falla=True),
+            Fase("recuperacion", 8 if rapido else 10, 4, 0.15)]
 
 
 # Resiliencia: "con_patron" es la configuración normal; "sin_patron" deja circuito y bulkhead inertes.
@@ -162,6 +165,7 @@ class Stack:
         self.p_ins, self.p_cupos, self.p_orq, self.p_pagos = libre(), libre(), libre(), libre()
         self.procesos: dict[str, subprocess.Popen] = {}
         self.fake = FakeTransbank(api_key=TBK_SECRET)
+        self.proxy = PagosProxy(self.pagos)
         self._rut = itertools.count(30_000_000)
         self._rut_lock = threading.Lock()
 
@@ -177,6 +181,7 @@ class Stack:
         log = (self.W / f"{nombre}.log").open("a")
         base = {**os.environ, "PYTHONPATH": str(self.W) + os.pathsep + os.environ.get("PYTHONPATH", "")}
         self.procesos[nombre] = subprocess.Popen(cmd, cwd=ROOT, env={**base, **env}, stdout=log, stderr=log)
+        log.close()
 
     def _esperar(self, url):
         for _ in range(200):
@@ -199,10 +204,11 @@ class Stack:
         subprocess.run([PY, "-m", "grpc_tools.protoc", f"-I{ROOT}/proto", f"--python_out={W}", f"--grpc_python_out={W}",
                         str(ROOT / "proto/cupos.proto")], check=True)
         self.fake.start()
+        self.proxy.start()
         r = PATRONES[self.variante]
         self._lanzar("cupos", [PY, str(ROOT / "cupos/src/server.py")], DB_PATH=str(W / "cupos.db"), GRPC_PORT=str(self.p_cupos))
         self._lanzar("inscripcion", [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(self.p_ins)],
-                     API_KEYS=ADMIN, JWT_SECRET="local-test-secret-at-least-32-characters", INTERNAL_KEY=INTERNAL,
+                     API_KEYS=ADMIN, INSCRIPCION_WRITER_KEY=WRITER, JWT_SECRET="local-test-secret-at-least-32-characters", INTERNAL_KEY=INTERNAL,
                      DATABASE_URL=f"sqlite:///{W}/inscripcion.db", CUPOS_GRPC_TARGET=f"127.0.0.1:{self.p_cupos}")
         self._lanzar("pagos", [PY, "-m", "uvicorn", "pagos.app.main:app", "--host", "127.0.0.1", "--port", str(self.p_pagos)],
                      DATABASE_URL=f"sqlite:///{W}/pagos.db", PAGOS_API_KEY=PAGOS_KEY, PAGOS_CALLBACK_KEY=CALLBACK,
@@ -212,7 +218,7 @@ class Stack:
                      PAGOS_CB_RECOVERY_SECONDS="5", PAGOS_CB_THRESHOLD=r["PAGOS_CB_THRESHOLD"], PAGOS_BULKHEAD=r["PAGOS_BULKHEAD"])
         self._lanzar("orquestador", [PY, "-m", "uvicorn", "app.orchestrator_main:app", "--host", "127.0.0.1", "--port", str(self.p_orq)],
                      SAGA_DATABASE_URL=f"sqlite:///{W}/sagas.db", ORCHESTRATOR_API_KEY=ORQ_KEY, INTERNAL_KEY=INTERNAL,
-                     SERVICE_API_KEY=ADMIN, INSCRIPCION_URL=self.ins, PAGOS_URL=self.pagos, PAGOS_API_KEY=PAGOS_KEY,
+                     SERVICE_API_KEY=ADMIN, INSCRIPCION_WRITER_KEY=WRITER, INSCRIPCION_URL=self.ins, PAGOS_URL=self.proxy.url, PAGOS_API_KEY=PAGOS_KEY,
                      PAGOS_CALLBACK_KEY=CALLBACK, CUPOS_GRPC_TARGET=f"127.0.0.1:{self.p_cupos}", SAGA_TIMEOUT_SECONDS="2",
                      SAGA_STALE_SECONDS="20", SAGA_RECONCILE_SECONDS="1", SAGA_PAGO_POLL_SECONDS="15",
                      SAGA_PAGO_GRACIA_SECONDS="60", SAGA_CB_RECOVERY_SECONDS="5",
@@ -247,7 +253,9 @@ class Stack:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
-        self.fake.stop()
+        self.proxy.stop()
+        if self.fake.thread.is_alive():
+            self.fake.stop()
 
     # --- datos de negocio
     def alumno(self, session=None) -> str:
@@ -279,7 +287,7 @@ class Stack:
         html = requests.get(pago_url, timeout=5).text
         token = re.search(r"name='token_ws' value='(\w+)'", html).group(1)
         self.fake.pagar(token, aprueba)
-        requests.get(f"{self.pagos}/v1/pagos/retorno", params={"token_ws": token}, timeout=15)
+        requests.get(f"{self.pagos}/v1/pagos/retorno", params={"token_ws": token}, timeout=15).raise_for_status()
 
     def falla_pagos(self, latencia_ms=0, falla=False):
         requests.put(f"{self.pagos}/internal/fault", json={"latencia_ms": latencia_ms, "falla": falla},
@@ -294,8 +302,6 @@ class Stack:
         con = sqlite3.connect(self.W / db, timeout=10)
         try:
             return dict(con.execute(sql).fetchall())
-        except sqlite3.Error:
-            return {}
         finally:
             con.close()
 
@@ -337,8 +343,8 @@ def parsear_metricas(texto: str) -> list[tuple[str, dict, float]]:
     return out
 
 
-def _valor(ms, nombre, **etq):
-    return next((v for n, e, v in ms if n == nombre and all(e.get(k) == x for k, x in etq.items())), 0.0)
+def _valor(ms, nombre, default=0.0, **etq):
+    return next((v for n, e, v in ms if n == nombre and all(e.get(k) == x for k, x in etq.items())), default)
 
 
 def _circuito(ms, dep):
@@ -348,23 +354,34 @@ def _circuito(ms, dep):
 def muestra_metricas(stack: Stack) -> dict:
     fila = {}
     try:
-        o = parsear_metricas(requests.get(f"{stack.orq}/metrics", timeout=2).text)
+        response = requests.get(f"{stack.orq}/metrics", timeout=2)
+        response.raise_for_status()
+        o = parsear_metricas(response.text)
         fila["orq_ok"] = 1
         for e in ESTADOS_SAGA:
             fila[f"orq_sagas_{e}"] = _valor(o, "sagas_total", estado=e)
-        fila["orq_compensaciones"] = _valor(o, "compensaciones_total")
+        fila["orq_compensaciones"] = _valor(o, "compensaciones_total", default=None)
+        fila["orq_admision_rech"] = _valor(o, "saga_admision_rechazos_total", default=None)
         for dep in ("RESERVAR", "COBRAR", "INSCRIBIR"):
             fila[f"orq_cb_{dep}"] = _circuito(o, dep)
-            fila[f"orq_bulkhead_rech_{dep}"] = _valor(o, "bulkhead_rechazos_total", dependencia=dep)
+            for op in ("forward", "compensacion", "consulta"):
+                fila[f"orq_cb_{dep}_{op}"] = next((e["estado"] for n, e, v in o if
+                    n == "saga_circuito_operacion_estado" and e.get("dependencia") == dep and
+                    e.get("operacion") == op and v == 1), "?")
+                fila[f"orq_intentos_{dep}_{op}"] = _valor(o, "saga_dependencia_intentos_total", default=None, dependencia=dep, operacion=op)
+                fila[f"orq_en_vuelo_{dep}_{op}"] = _valor(o, "saga_dependencia_en_vuelo", default=None, dependencia=dep, operacion=op)
+            fila[f"orq_bulkhead_rech_{dep}"] = _valor(o, "bulkhead_rechazos_total", default=None, dependencia=dep)
     except requests.RequestException:
         fila["orq_ok"] = 0
     try:
-        p = parsear_metricas(requests.get(f"{stack.pagos}/metrics", timeout=2).text)
+        response = requests.get(f"{stack.pagos}/metrics", timeout=2)
+        response.raise_for_status()
+        p = parsear_metricas(response.text)
         fila["pagos_ok"] = 1
         fila["pagos_cb"] = _circuito(p, "TRANSBANK")
-        fila["pagos_bulkhead_rech"] = _valor(p, "bulkhead_rechazos_total", dependencia="TRANSBANK")
-        fila["pagos_circuito_rech"] = _valor(p, "circuito_rechazos_total", dependencia="TRANSBANK")
-        fila["pagos_tbk_intentos"] = _valor(p, "transbank_intentos_total")
+        fila["pagos_bulkhead_rech"] = _valor(p, "bulkhead_rechazos_total", default=None, dependencia="TRANSBANK")
+        fila["pagos_circuito_rech"] = _valor(p, "circuito_rechazos_total", default=None, dependencia="TRANSBANK")
+        fila["pagos_tbk_intentos"] = _valor(p, "transbank_intentos_total", default=None)
     except requests.RequestException:
         fila["pagos_ok"] = 0
     return fila
@@ -449,115 +466,158 @@ def cascada(stack: Stack, fases: list[Fase], ts: str, drenaje_s: float, rep: int
     print(f"[E3 {variante} · repetición {rep}] preparando…", flush=True)
     necesarios = int(sum(f.workers * f.segundos / f.think for f in fases if f.destino == "matriculas") * 1.1) + 20
     pool = PoolAlumnos(stack, necesarios)
-    sid_sonda = stack.matricular(pool.tomar()).json()["id"]  # saga fija para la sonda del orquestador
+    probe = stack.matricular(pool.tomar()).json()
+    sid_sonda = probe["id"]
+    if probe.get('estado') == 'ESPERANDO_PAGO':
+        stack.comprador(probe['pago_url'], True)
     inicio = time.monotonic()
     fase_actual = [fases[0].nombre]
     reqs, sondas, metricas, estados, marcas = [], [], [], [], []
     parar_sondas, parar_muestreo = threading.Event(), threading.Event()
+    sampling_lock = threading.Lock()
 
     def t_rel():
-        return round(time.monotonic() - inicio, 3)
+        return round(time.monotonic() - inicio, 4)
+
+    def sample(punto='periodico'):
+        # Serializar lecturas evita falsos reinicios de contador por orden de llegada.
+        with sampling_lock:
+            values = muestra_metricas(stack)
+            row = dict(t=t_rel(), fase=fase_actual[0], punto=punto, **values)
+            metricas.append(row)
+            return row['t']
 
     def muestrear():
         while not parar_muestreo.is_set():
-            fila = {"t": t_rel(), "fase": fase_actual[0], **muestra_metricas(stack)}
-            metricas.append(fila)
+            sample()
             parar_muestreo.wait(0.5)
 
     def sondear(nombre, url, headers):
-        s = requests.Session()
-        while not parar_sondas.is_set():
-            t0 = time.monotonic()
-            try:
-                codigo = s.get(url, headers=headers, timeout=10).status_code
-            except requests.RequestException:
-                codigo = 0
-            sondas.append({"t": round(t0 - inicio, 3), "fase": fase_actual[0], "sonda": nombre,
-                           "codigo": codigo, "latencia_s": round(time.monotonic() - t0, 4)})
-            parar_sondas.wait(0.25)
+        with requests.Session() as session:
+            while not parar_sondas.is_set():
+                t0, phase = time.monotonic(), fase_actual[0]
+                try:
+                    codigo = session.get(url, headers=headers, timeout=10).status_code
+                except requests.RequestException:
+                    codigo = 0
+                sondas.append(dict(t=round(t0-inicio, 4), fase=phase, sonda=nombre,
+                                   codigo=codigo, latencia_s=round(time.monotonic()-t0, 4)))
+                parar_sondas.wait(0.25)
 
-    def worker(fase: Fase, fin: float):
-        s = requests.Session()
-        while time.monotonic() < fin and fase.destino == "pagos":
-            t0 = time.monotonic()
-            try:
-                r = s.post(f"{stack.pagos}/v1/payments", timeout=20, json={"alumno_id": str(uuid.uuid4()), "curso_id": 1, "monto": 15000},
-                           headers={"X-API-Key": PAGOS_KEY, "Idempotency-Key": f"exp-{uuid.uuid4()}:COBRAR"})
-                codigo = r.status_code
-                estado = "PENDIENTE" if codigo == 201 else (r.json().get("error", {}).get("code", "?") if r.headers.get("content-type", "").startswith("application/json") else "?")
-            except requests.RequestException as exc:
-                codigo, estado = 0, type(exc).__name__
-            reqs.append({"t": round(t0 - inicio, 3), "fase": fase.nombre, "codigo": codigo, "estado": estado,
-                         "latencia_s": round(time.monotonic() - t0, 4)})
-            time.sleep(fase.think)
-        while time.monotonic() < fin and fase.destino == "matriculas":
-            alumno = pool.tomar()
-            if alumno is None:
-                reqs.append({"t": t_rel(), "fase": fase.nombre, "codigo": -1, "estado": "SIN_ALUMNOS", "latencia_s": 0.0})
-                return
-            t0 = time.monotonic()
-            try:
-                r = stack.matricular(alumno, s, timeout=20)
-                codigo, estado = r.status_code, (r.json().get("estado") if r.headers.get("content-type", "").startswith("application/json") else "?")
-            except requests.RequestException as exc:
-                codigo, estado = 0, type(exc).__name__
-            reqs.append({"t": round(t0 - inicio, 3), "fase": fase.nombre, "codigo": codigo, "estado": estado,
-                         "latencia_s": round(time.monotonic() - t0, 4)})
-            time.sleep(fase.think)
+    def worker(fase, fin):
+        with requests.Session() as session:
+            while time.monotonic() < fin:
+                alumno = pool.tomar() if fase.destino == 'matriculas' else str(uuid.uuid4())
+                if alumno is None:
+                    reqs.append(dict(t=t_rel(), fase=fase.nombre, codigo=-1, estado='SIN_ALUMNOS', latencia_s=0))
+                    return
+                t0 = time.monotonic()
+                key, data = f'exp-{uuid.uuid4()}:COBRAR', {}
+                row = dict(t=round(t0-inicio, 4), fase=fase.nombre, destino=fase.destino)
+                try:
+                    if fase.destino == 'pagos':
+                        response = session.post(stack.pagos+'/v1/payments', timeout=20,
+                            json=dict(alumno_id=alumno, curso_id=1, monto=15000),
+                            headers={'X-API-Key': PAGOS_KEY, 'Idempotency-Key': key})
+                    else:
+                        response = stack.matricular(alumno, session, timeout=20)
+                    data = response.json()
+                    row.update(codigo=response.status_code, estado=data.get('estado'),
+                               motivo_fallo=data.get('motivo_fallo', ''), saga_id=data.get('id', ''),
+                               error_code=data.get('error', {}).get('code', ''))
+                except (requests.RequestException, ValueError) as exc:
+                    row.update(codigo=0, estado=type(exc).__name__)
+                row['latencia_s'] = round(time.monotonic()-t0, 4)
+                # Medir la solicitud antes del comprador; conservar aparte su coste/error.
+                try:
+                    if fase.destino == 'pagos':
+                        cleanup = session.post(stack.pagos+'/v1/payments/refund', timeout=20,
+                            json={'original_key': key}, headers={'X-API-Key': PAGOS_KEY,
+                            'Idempotency-Key': 'cleanup:'+key})
+                        cleanup.raise_for_status()
+                    elif data.get('estado') == 'ESPERANDO_PAGO':
+                        tb = time.monotonic()
+                        stack.comprador(data['pago_url'], True)
+                        row['comprador_s'] = round(time.monotonic()-tb, 4)
+                except (requests.RequestException, AttributeError, ValueError) as exc:
+                    row['comprador_error'] = type(exc).__name__
+                reqs.append(row)
+                time.sleep(fase.think)
 
     hilos = [threading.Thread(target=muestrear, daemon=True),
-             threading.Thread(target=sondear, daemon=True, args=("orq_sagas", f"{stack.orq}/v1/sagas/{sid_sonda}", {"X-API-Key": ORQ_KEY})),
-             threading.Thread(target=sondear, daemon=True, args=("ins_enrollments", f"{stack.ins}/v1/enrollments?limit=1", {"X-API-Key": ADMIN})),
-             threading.Thread(target=sondear, daemon=True, args=("pagos_health", f"{stack.pagos}/v1/health", {}))]
-    for h in hilos:
-        h.start()
-
+             threading.Thread(target=sondear, daemon=True, args=('orq_sagas', stack.orq+'/v1/sagas/'+sid_sonda, {'X-API-Key': ORQ_KEY})),
+             threading.Thread(target=sondear, daemon=True, args=('ins_enrollments', stack.ins+'/v1/enrollments?limit=1', {'X-API-Key': ADMIN})),
+             threading.Thread(target=sondear, daemon=True, args=('pagos_health', stack.pagos+'/v1/health', {}))]
+    for hilo in hilos:
+        hilo.start()
+    proxy = getattr(stack, 'proxy', None)
     try:
         for fase in fases:
             fase_actual[0] = fase.nombre
-            stack.falla_pagos(fase.latencia_ms, fase.falla)
+            if proxy:
+                proxy.configure(fase.latencia_ms if fase.falla_en == 'pagos' else 0, fase.nombre)
+            stack.falla_pagos(fase.latencia_ms if fase.falla_en == 'transbank' else 0, fase.falla)
             antes = stack.snapshot()
-            t_ini = t_rel()
-            print(f"  fase {fase.nombre:<12} {fase.segundos:>4.0f} s · {fase.workers:>2} workers · latencia TBK {fase.latencia_ms} ms · caído={fase.falla} · → {fase.destino}", flush=True)
+            t_ini = sample('inicio')
+            print(f"  fase {fase.nombre:<20} {fase.segundos:>3.0f}s · {fase.workers:>2} workers · {fase.falla_en} {fase.latencia_ms}ms · → {fase.destino}", flush=True)
             fin = time.monotonic() + fase.segundos
-            ts_w = [threading.Thread(target=worker, args=(fase, fin)) for _ in range(fase.workers)]
-            for h in ts_w:
-                h.start()
-            for h in ts_w:
-                h.join()
-            marcas.append({"variante": variante, "fase": fase.nombre, "t_ini": t_ini, "t_fin": t_rel(), "workers": fase.workers,
-                           "think_s": fase.think, "tbk_latencia_ms": fase.latencia_ms, "tbk_caido": int(fase.falla), "destino": fase.destino})
-            estados.append({"variante": variante, "momento": f"antes_{fase.nombre}", "t": t_ini, **antes})
-            estados.append({"variante": variante, "momento": f"despues_{fase.nombre}", "t": t_rel(), **stack.snapshot()})
+            workers = [threading.Thread(target=worker, args=(fase, fin)) for _ in range(fase.workers)]
+            for hilo in workers:
+                hilo.start()
+            for hilo in workers:
+                hilo.join()
+            t_fin = sample('fin')
+            marcas.append(dict(fase=fase.nombre, t_ini=t_ini, t_fin=t_fin, workers=fase.workers, think_s=fase.think,
+                falla_en=fase.falla_en, pagos_latencia_ms=fase.latencia_ms if fase.falla_en == 'pagos' else 0,
+                tbk_latencia_ms=fase.latencia_ms if fase.falla_en == 'transbank' else 0,
+                tbk_caido=int(fase.falla), destino=fase.destino, saga_timeout_s=2, tbk_timeout_s=1.5, comprador='aprobar'))
+            estados.extend([dict(momento='antes_'+fase.nombre, t=t_ini, **antes),
+                            dict(momento='despues_'+fase.nombre, t=t_fin, **stack.snapshot())])
         stack.falla_pagos(0, False)
-        parar_sondas.set()
-        # Convergencia: tras la falla, ¿cuánto tarda el sistema en dejar de tener sagas a medias?
-        fase_actual[0] = "drenaje"
-        t_fin = time.monotonic()
-        convergio = None
-        while time.monotonic() - t_fin < drenaje_s:
+        if proxy:
+            proxy.configure()
+        fase_actual[0] = 'drenaje'
+        t_drain, convergio = time.monotonic(), None
+        while time.monotonic()-t_drain < drenaje_s:
             snap = stack.snapshot()
-            if sum(snap[f"sagas_{e}"] for e in EN_VUELO) == 0:
-                convergio = time.monotonic() - t_fin
+            pending = sum(snap.get('sagas_'+e, 0) for e in (*EN_VUELO, 'ESPERANDO_PAGO'))
+            pending += snap.get('pagos_PENDIENTE', 0) + snap.get('pagos_PROCESANDO', 0)
+            if not pending and not (proxy and proxy.active):
+                convergio = time.monotonic()-t_drain
                 break
-            time.sleep(1)
+            time.sleep(0.2)
         final = stack.snapshot()
-        completadas, esperando = final["sagas_COMPLETADA"], final["sagas_ESPERANDO_PAGO"]
-        final.update(dict(convergencia_s=round(convergio, 1) if convergio is not None else -1,
-                          sagas_en_vuelo=sum(final[f"sagas_{e}"] for e in EN_VUELO),
-                          cupos_huerfanos=final["cupos_ocupados"] - completadas - esperando,
-                          cobros_huerfanos=final["pagos_COBRADO"] - completadas))
-        estados.append({"variante": variante, "momento": "final", "t": t_rel(), **final})
-        print(f"  convergencia: {'%.1f s' % convergio if convergio is not None else 'NO convergió en %.0f s' % drenaje_s}; "
-              f"cupos huérfanos={final['cupos_huerfanos']}, cobros huérfanos={final['cobros_huerfanos']}", flush=True)
+        final.update(convergencia_s=round(convergio, 3) if convergio is not None else -1,
+            negocio_cerrado=convergio is not None,
+            sagas_en_vuelo=sum(final.get('sagas_'+e, 0) for e in EN_VUELO),
+            cupos_huerfanos=final['cupos_ocupados']-final['sagas_COMPLETADA']-final['sagas_ESPERANDO_PAGO'],
+            cobros_huerfanos=final['pagos_COBRADO']-final['sagas_COMPLETADA'])
+        estados.append(dict(momento='final', t=t_rel(), **final))
+        # Comprobar la integridad por clave además de los totales agregados.
+        for row in reqs:
+            if row.get('saga_id') and row.get('destino') == 'matriculas':
+                current = stack.saga(row['saga_id'])
+                row['estado_final'] = current['estado']
+                row['pasos_firmes'] = stack.pasos(row['saga_id'])
+        sample('final')
+        print(f"  cerrado={final['negocio_cerrado']} · COMPLETADA={final['sagas_COMPLETADA']} · COMPENSADA={final['sagas_COMPENSADA']} · huérfanos={final['cupos_huerfanos']}/{final['cobros_huerfanos']}", flush=True)
     finally:
         parar_sondas.set()
         parar_muestreo.set()
-        for h in hilos:
-            h.join(timeout=5)
-    for fila in reqs + sondas + metricas + marcas + estados:
-        fila["variante"], fila["rep"] = variante, rep
-    return dict(requests=reqs, sondas=sondas, metricas=metricas, fases=marcas, estados=estados)
+        for hilo in hilos:
+            hilo.join(timeout=12)
+    frontera = []
+    if proxy:
+        with proxy.lock:
+            frontera = [dict(event, t=round(event['recibido']-inicio, 4)) for event in proxy.events]
+        for row in reqs:
+            if row.get('motivo_fallo') == 'PAGOS_CIRCUITO_ABIERTO':
+                sid = row['saga_id']
+                row['fail_fast_sin_efectos'] = int(not row['pasos_firmes'] and
+                    not any(e['clave'].startswith(sid+':') for e in frontera))
+    for fila in reqs + sondas + metricas + marcas + estados + frontera:
+        fila['variante'], fila['rep'] = variante, rep
+    return dict(requests=reqs, sondas=sondas, metricas=metricas, fases=marcas, estados=estados, frontera=frontera)
 
 
 # ------------------------------------------------------------------------------------------ principal
@@ -579,32 +639,57 @@ def main():
     ts, prefijo = args.ts, f"saga_fallas_{args.ts}"
     print(f"Experimento saga_fallas · {ts} · {'rápido' if args.rapido else 'completo'}", flush=True)
 
+    files = sorted(path for folder in ('matriculas-api/app', 'cupos/src', 'pagos/app', 'experiment', 'tests/support')
+                   for path in (ROOT/folder).rglob('*.py') if '__pycache__' not in path.parts and 'grpc_stubs' not in path.parts)
+    files += sorted((ROOT/'proto').glob('*.proto'))
+    source_hash = hashlib.sha256()
+    for path in files:
+        source_hash.update(str(path.relative_to(ROOT)).encode()+b'\0'+path.read_bytes())
+    invocation = dict(ts=ts, started_at=datetime.now(timezone.utc).isoformat(), source_sha256=source_hash.hexdigest(),
+        git_head=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
+        git_status=subprocess.check_output(['git','status','--short'], cwd=ROOT, text=True),
+        python=sys.version, argv=sys.argv[1:], patrones=PATRONES,
+        fases=[vars(f) for f in plan(args.rapido)], timeout_saga_s=2, timeout_tbk_s=1.5)
+    manifest_path = RAW/f'{prefijo}_manifest.json'
+    previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    history = previous.get('invocations', [previous] if previous else [])
+    manifest = dict(ts=ts, invocations=history+[invocation])
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+
     if not args.solo_cascada:
         filas_base = []
         for escenario, esperado, falla in ESCENARIOS_BASE:
-            stack = Stack("base", "con_patron").start()
+            stack = Stack("base", "con_patron")
             try:
+                stack.start()
                 filas_base.extend(escenario_base(stack, args.repeticiones_base, escenario, esperado, falla))
             finally:
                 stack.stop()
         escribir_csv(RAW / f"{prefijo}_escenarios.csv", filas_base)
 
     if not args.solo_base:
-        todo = {k: [] for k in ("requests", "sondas", "metricas", "fases", "estados")}
+        todo = {k: [] for k in ("requests", "sondas", "metricas", "fases", "estados", "frontera")}
         variantes = [v.strip() for v in args.variantes.split(",") if v.strip()]
         reps = list(range(args.desde_rep, args.desde_rep + args.repeticiones))
         for rep in reps:
             for variante in variantes:
-                stack = Stack("cascada", variante).start()
+                stack = Stack("cascada", variante)
                 try:
+                    stack.start()
                     datos = cascada(stack, plan(args.rapido), ts, args.drenaje, rep)
                 finally:
                     stack.stop()
                 for k in todo:
                     todo[k].extend(datos[k])
+                    ruta = RAW / f"{prefijo}_{k}.csv"
+                    escribir_csv(ruta, fusionar(ruta, datos[k], [variante], [rep]))
         for k, filas in todo.items():
             ruta = RAW / f"{prefijo}_{k}.csv"
             escribir_csv(ruta, fusionar(ruta, filas, variantes, reps))
+
+    manifest['dataset_sha256'] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(RAW.glob(f'{prefijo}_*.csv'))}
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
 
     if not args.sin_graficar:
         sys.path.insert(0, str(ROOT / "experiment"))

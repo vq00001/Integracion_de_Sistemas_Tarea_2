@@ -3,7 +3,7 @@
 Uso:  python experiment/graficar_saga_fallas.py [<ts>]      (por defecto, el experimento más reciente)
 Lee experiment/data/raw/saga_fallas_<ts>_*.csv y escribe en experiment/results/:
   saga_fallas_cascada_<ts>.png       línea de tiempo (1.ª repetición) con y sin patrón: latencias, circuito, bulkhead, sagas
-  saga_fallas_fases_<ts>.png         comparación por fase (mediana de las repeticiones; barras de error = rango del p95)
+  saga_fallas_fases_<ts>.png         comparación por fase (medianas entre repeticiones; rangos del p95 en CSV)
   saga_fallas_antes_despues_<ts>.png estado de los tres servicios antes/después en E1 y E2
   saga_fallas_fases_<ts>.csv|md      tabla por variante y fase (medianas) y saga_fallas_fases_por_rep_<ts>.csv (cada repetición)
   resumen_saga_fallas_<ts>.md        lectura de la evidencia con los números reales de la corrida
@@ -11,6 +11,8 @@ Lee experiment/data/raw/saga_fallas_<ts>_*.csv y escribe en experiment/results/:
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
 from pathlib import Path
 
 import matplotlib
@@ -25,7 +27,7 @@ RAW, OUT = BASE / "data" / "raw", BASE / "results"
 VARIANTES = ("con_patron", "sin_patron")
 ETIQ = {"con_patron": "CON patrón (Circuit Breaker + Bulkhead)", "sin_patron": "SIN patrón (circuito y bulkhead inertes)"}
 COLOR = {"con_patron": "#1f77b4", "sin_patron": "#d62728"}
-FASES = ("antes", "lenta", "alivio", "bulkhead", "pico", "caida", "recuperacion")
+FASES = ("antes", "pagos_lento", "pagos_recuperacion", "lenta", "alivio", "bulkhead", "pico", "caida", "recuperacion")
 ACEPTADAS = (201, 202)  # 202 = matrícula en espera de pago; 201 = cobro creado (fase de carga directa a Pagos)
 RAPIDA = 0.2  # una respuesta "rápida" (fail-fast) tarda menos de 200 ms
 
@@ -53,44 +55,65 @@ def _leer(ts: str, nombre: str):
     return df
 
 
-def _valor_en(m: pd.DataFrame, t: float, col: str) -> float:
-    s = m[(m["t"] <= t) & m[col].notna()]
-    return float(s[col].iloc[-1]) if len(s) else 0.0
+def _valor_en(m, t, col):
+    if col not in m:
+        return np.nan
+    s = m[(m.t <= t) & m[col].notna()]
+    return float(s[col].iloc[-1]) if len(s) else np.nan
 
 
 def _sel(d: dict, v: str, rep: int):
     return (d[k][(d[k]["variante"] == v) & (d[k]["rep"] == rep)] for k in ("requests", "sondas", "metricas", "fases"))
 
 
-def tabla_por_rep(d: dict) -> pd.DataFrame:
+def tabla_por_rep(d):
     filas = []
     for v in VARIANTES:
-        for rep in sorted(d["requests"][d["requests"]["variante"] == v]["rep"].unique()):
+        for rep in sorted(d['fases'].loc[d['fases'].variante == v, 'rep'].unique()):
             rq0, sd, mt, fs = _sel(d, v, rep)
+            mt = mt.sort_values('t', kind='stable')
+            counters = [c for c in mt if c.startswith(('orq_intentos_', 'orq_bulkhead_rech_')) or c in
+                        ('pagos_tbk_intentos', 'pagos_bulkhead_rech', 'pagos_circuito_rech', 'orq_admision_rech', 'orq_compensaciones')]
+            for col in counters:
+                if (mt[col].dropna().diff() < 0).any():
+                    raise ValueError(f'Contador reiniciado: {col}, {v}, rep {rep}; la métrica no permite calcular deltas')
             for _, f in fs.iterrows():
-                r = rq0[(rq0["fase"] == f["fase"]) & (rq0["codigo"] != -1)]
-                s = sd[sd["fase"] == f["fase"]]
-                so, si, sp = (s[s["sonda"] == n] for n in ("orq_sagas", "ins_enrollments", "pagos_health"))
-                dur = max(f["t_fin"] - f["t_ini"], 1e-9)
-                delta = lambda col: _valor_en(mt, f["t_fin"], col) - _valor_en(mt, f["t_ini"], col)  # noqa: E731
-                bulk_orq = sum(delta(c) for c in mt.columns if c.startswith("orq_bulkhead_rech_"))
+                r = rq0[(rq0.fase == f.fase) & (rq0.codigo != -1)]
+                s = sd[sd.fase == f.fase]
+                phase_metrics = mt[mt.fase == f.fase]
+                def delta(col):
+                    if col not in mt:
+                        return np.nan
+                    if 'punto' in phase_metrics:
+                        a = phase_metrics[phase_metrics.punto == 'inicio'][col].dropna()
+                        b = phase_metrics[phase_metrics.punto == 'fin'][col].dropna()
+                        return float(b.iloc[-1]-a.iloc[0]) if len(a) and len(b) else np.nan
+                    return _valor_en(mt, f.t_fin, col)-_valor_en(mt, f.t_ini, col)
+                def peak(col):
+                    return phase_metrics[col].max() if col in phase_metrics else np.nan
                 n = len(r)
-                filas.append({
-                    "variante": v, "rep": int(rep), "fase": f["fase"], "destino": f.get("destino", "matriculas"), "workers": int(f["workers"]),
-                    "tbk_latencia_ms": int(f["tbk_latencia_ms"]), "tbk_caido": int(f["tbk_caido"]), "peticiones": n, "req_por_s": len(r) / dur,
-                    "p50_s": r["latencia_s"].median(), "p95_s": r["latencia_s"].quantile(0.95), "max_s": r["latencia_s"].max(),
-                    "pct_aceptadas": 100 * r["codigo"].isin(ACEPTADAS).mean() if n else np.nan,
-                    "pct_503": 100 * (r["codigo"] == 503).mean() if n else np.nan,
-                    "pct_otros": 100 * (~r["codigo"].isin(ACEPTADAS + (503,))).mean() if n else np.nan,
-                    "pct_rapidas": 100 * (r["latencia_s"] < RAPIDA).mean() if n else np.nan,
-                    "sonda_orq_p95_s": so["latencia_s"].quantile(0.95) if len(so) else np.nan,
-                    "sonda_orq_fallos": int((so["codigo"] != 200).sum()),
-                    "sonda_ins_p95_s": si["latencia_s"].quantile(0.95) if len(si) else np.nan,
-                    "sonda_pagos_p95_s": sp["latencia_s"].quantile(0.95) if len(sp) else np.nan,
-                    "rechazos_bulkhead_orq": bulk_orq,
-                    "rechazos_bulkhead_pagos": delta("pagos_bulkhead_rech"),
-                    "rechazos_circuito_tbk": delta("pagos_circuito_rech"), "intentos_a_tbk": delta("pagos_tbk_intentos"),
-                })
+                reason = r.get('motivo_fallo', pd.Series('', index=r.index)).fillna('')
+                ff = (r.codigo == 503) & (reason == 'PAGOS_CIRCUITO_ABIERTO') & (r.latencia_s < RAPIDA)
+                row = dict(variante=v, rep=int(rep), fase=f.fase, destino=f.get('destino', 'matriculas'), workers=int(f.workers),
+                    tbk_latencia_ms=f.tbk_latencia_ms, tbk_caido=f.tbk_caido, pagos_latencia_ms=f.get('pagos_latencia_ms', np.nan),
+                    peticiones=n, req_por_s=n/max(f.t_fin-f.t_ini, 1e-9), p50_s=r.latencia_s.median(),
+                    p95_s=r.latencia_s.quantile(.95), max_s=r.latencia_s.max(),
+                    pct_aceptadas=100*r.codigo.isin(ACEPTADAS).mean(), pct_503=100*(r.codigo == 503).mean(),
+                    pct_429=100*(r.codigo == 429).mean(), pct_otros=100*(~r.codigo.isin(ACEPTADAS+(503,429))).mean(),
+                    pct_rapidas=100*(r.latencia_s < RAPIDA).mean(), pct_fail_fast_orq=100*ff.mean(),
+                    rechazos_bulkhead_orq=sum(delta(c) for c in mt if c.startswith('orq_bulkhead_rech_')),
+                    rechazos_admision_orq=delta('orq_admision_rech'), compensaciones_orq=delta('orq_compensaciones'),
+                    intentos_a_pagos=delta('orq_intentos_COBRAR_forward'),
+                    reembolsos_a_pagos=delta('orq_intentos_COBRAR_compensacion'),
+                    consultas_a_pagos=delta('orq_intentos_COBRAR_consulta'),
+                    orq_cobros_en_vuelo_max=peak('orq_en_vuelo_COBRAR_forward'),
+                    rechazos_bulkhead_pagos=delta('pagos_bulkhead_rech'),
+                    rechazos_circuito_tbk=delta('pagos_circuito_rech'), intentos_a_tbk=delta('pagos_tbk_intentos'))
+                for name, short in [('orq_sagas','orq'), ('ins_enrollments','ins'), ('pagos_health','pagos')]:
+                    probes = s[s.sonda == name]
+                    row[f'sonda_{short}_p95_s'] = probes.latencia_s.quantile(.95)
+                    row[f'sonda_{short}_fallos'] = int((probes.codigo != 200).sum())
+                filas.append(row)
     return pd.DataFrame(filas)
 
 
@@ -107,7 +130,7 @@ def tabla_agregada(por_rep: pd.DataFrame) -> pd.DataFrame:
 
 
 def _sombrear(ax, fs: pd.DataFrame, etiquetar=False):
-    colores = {"antes": "#e8f5e9", "lenta": "#fff3e0", "alivio": "#f1f8e9", "bulkhead": "#ede7f6", "pico": "#ffe0b2",
+    colores = {"pagos_lento": "#fff9c4", "pagos_recuperacion": "#e0f2f1", "antes": "#e8f5e9", "lenta": "#fff3e0", "alivio": "#f1f8e9", "bulkhead": "#ede7f6", "pico": "#ffe0b2",
                "caida": "#ffcdd2", "recuperacion": "#e3f2fd"}
     for _, f in fs.iterrows():
         ax.axvspan(f["t_ini"], f["t_fin"], color=colores.get(f["fase"], "#eee"), alpha=0.9, lw=0)
@@ -115,81 +138,60 @@ def _sombrear(ax, fs: pd.DataFrame, etiquetar=False):
             ax.text((f["t_ini"] + f["t_fin"]) / 2, 1.02, f["fase"], transform=ax.get_xaxis_transform(), ha="center", fontsize=9)
 
 
-def fig_cascada(d: dict, ts: str) -> Path:
-    rep = int(d["requests"]["rep"].min())
-    nreps = int(d["requests"]["rep"].nunique())
-    fig, axes = plt.subplots(4, 2, figsize=(17, 14), sharex="col")
-    lim = {}
-    for j, v in enumerate(VARIANTES):
-        rq, sd, mt, fs = _sel(d, v, rep)
-        rq = rq[rq["codigo"] != -1]
-        a1, a2, a3, a4 = axes[:, j]
-        for a in axes[:, j]:
-            _sombrear(a, fs, etiquetar=a is a1)
-        for cods, col, nom in (((201, 202), "#1f77b4", "201/202 aceptada (en espera de pago)"), ((503,), "#d62728", "503 compensada / fail-fast")):
-            s = rq[rq["codigo"].isin(cods)]
-            a1.scatter(s["t"], s["latencia_s"], s=6, c=col, label=nom, alpha=0.6)
-        otros = rq[~rq["codigo"].isin((201, 202, 503))]
-        a1.scatter(otros["t"], otros["latencia_s"], s=10, c="k", marker="x", label="otro (502, timeout cliente…)")
-        a1.axhline(RAPIDA, color="gray", ls=":", lw=1)
-        a1.set_yscale("log"); a1.set_ylabel("cobros / matrículas\nlatencia (s)"); a1.legend(loc="upper left", fontsize=8)
-        a1.set_title(ETIQ[v], fontsize=12, pad=24, color=COLOR[v], fontweight="bold")
-        for nombre, col, nom in (("orq_sagas", "#ff7f0e", "GET /v1/sagas/{id} (mismo proceso que la saga)"),
-                                 ("pagos_health", "#9467bd", "GET /v1/health de Pagos (mismo proceso que Transbank)"),
-                                 ("ins_enrollments", "#2ca02c", "GET /v1/enrollments (otro servicio)")):
-            s = sd[sd["sonda"] == nombre]
-            a2.plot(s["t"], s["latencia_s"], color=col, lw=1.2, label=nom)
-            malos = s[s["codigo"] != 200]
-            a2.scatter(malos["t"], malos["latencia_s"], c="k", marker="x", s=25, zorder=5)
-        a2.set_yscale("log"); a2.set_ylabel("el resto del sistema\nlatencia (s)"); a2.legend(loc="upper left", fontsize=8)
-        for col, c, nom in (("pagos_cb", "#9467bd", "Pagos→Transbank"), ("orq_cb_COBRAR", "#8c564b", "Orquestador→Pagos")):
-            a3.step(mt["t"], (mt[col] == "OPEN").astype(int), where="post", color=c, lw=1.6, label=f"circuito {nom} OPEN")
-        a3.set_ylim(-0.1, 1.3); a3.set_yticks([0, 1]); a3.set_yticklabels(["CLOSED", "OPEN"])
-        rech = sum(mt[c].fillna(0) for c in mt.columns if c.startswith("orq_bulkhead_rech_")) + mt["pagos_bulkhead_rech"].fillna(0)
-        b = a3.twinx(); b.plot(mt["t"], rech, color="k", lw=1, ls="--", label="rechazos bulkhead (acum.)"); b.set_ylabel("rechazos acumulados")
-        a3.legend(loc="upper left", fontsize=8); b.legend(loc="center left", fontsize=8)
-        en_vuelo = mt["orq_sagas_EN_CURSO"].fillna(0) + mt["orq_sagas_COMPENSANDO"].fillna(0)
-        for serie, c, nom in ((mt["orq_sagas_COMPENSADA"], "#d62728", "COMPENSADA"), (mt["orq_sagas_COMPENSACION_PENDIENTE"], "#000000", "COMPENSACION_PENDIENTE"),
-                              (en_vuelo, "#ff7f0e", "en vuelo (EN_CURSO + COMPENSANDO)"), (mt["orq_sagas_ESPERANDO_PAGO"], "#1f77b4", "ESPERANDO_PAGO")):
-            a4.plot(mt["t"], serie, color=c, lw=1.4, label=nom)
-        a4.set_ylabel("sagas por estado"); a4.set_xlabel("tiempo desde el inicio de la carga (s)"); a4.legend(loc="upper left", fontsize=8)
-        for i, a in enumerate((a1, a2, a4)):
-            lim.setdefault(i, []).append(a.get_ylim())
-    for i, fila in zip((0, 1, 2), (0, 1, 3)):
-        lo, hi = min(x[0] for x in lim[i]), max(x[1] for x in lim[i])
-        for j in range(2):
-            axes[fila, j].set_ylim(lo, hi)
-    fig.suptitle(f"Escenario 3 · misma carga y misma línea de tiempo, con y sin patrón (repetición {rep} de {nreps})", fontsize=14, y=0.995)
+def fig_cascada(d, ts):
+    rep = int(d['fases'].rep.min())
+    fig, axes = plt.subplots(6, 2, figsize=(19, 20), sharex='col', sharey='row')
+    for j, variant in enumerate(VARIANTES):
+        rq, sd, mt, fs = _sel(d, variant, rep)
+        for ax in axes[:,j]:
+            _sombrear(ax, fs)
+        axes[0,j].set_title(ETIQ[variant]+f' · repetición {rep}')
+        for code in sorted(rq.codigo.unique()):
+            rows = rq[rq.codigo == code]
+            axes[0,j].scatter(rows.t, rows.latencia_s, s=5, alpha=.5, label=str(code),
+                               color={201:'#1f77b4',202:'#ff7f0e',429:'#777777',503:'#d62728'}.get(code,'black'))
+        axes[0,j].set_ylabel('POST inicial (s)'); axes[0,j].legend(fontsize=8)
+        for name in sd.sonda.unique():
+            rows = sd[sd.sonda == name]
+            axes[1,j].plot(rows.t, rows.latencia_s, label=name, lw=.8)
+        axes[1,j].set_ylabel('Sondas (s)'); axes[1,j].legend(fontsize=8)
+        mapping = {'CLOSED':0, 'HALF_OPEN':1, 'OPEN':2}
+        for col, label in [('orq_cb_COBRAR','Orq→Pagos (crear)'), ('pagos_cb','Pagos→Transbank')]:
+            axes[2,j].step(mt.t, mt[col].map(mapping), where='post', label=label)
+        axes[2,j].set_yticks([0,1,2], ['CLOSED','HALF_OPEN','OPEN']); axes[2,j].legend(fontsize=8)
+        for col, label in [('orq_admision_rech','Admisión Orq'), ('pagos_bulkhead_rech','Bulkhead Pagos')]:
+            if col in mt:
+                axes[3,j].plot(mt.t, mt[col], label=label)
+        axes[3,j].set_ylabel('Rechazos acumulados'); axes[3,j].legend(fontsize=8)
+        for col, label in [('orq_intentos_COBRAR_forward','Intentos Orq→Pagos'), ('pagos_tbk_intentos','Intentos Pagos→TBK')]:
+            if col in mt:
+                axes[4,j].plot(mt.t, mt[col], label=label)
+        axes[4,j].set_ylabel('Intentos acumulados'); axes[4,j].legend(fontsize=8)
+        for state in ('COMPLETADA','COMPENSADA','ESPERANDO_PAGO','COMPENSACION_PENDIENTE'):
+            axes[5,j].plot(mt.t, mt['orq_sagas_'+state], label=state)
+        axes[5,j].set_ylabel('Sagas'); axes[5,j].legend(fontsize=7)
+        axes[5,j].set_xticks((fs.t_ini+fs.t_fin)/2,
+            [f'{row.fase} ({row.t_ini:.0f}–{row.t_fin:.0f}s)' for _,row in fs.iterrows()],
+            rotation=60, ha='right', fontsize=8)
+        axes[5,j].set_xlabel('Tiempo desde el inicio; límites efectivos de cada fase')
     fig.tight_layout()
-    ruta = OUT / f"saga_fallas_cascada_{ts}.png"
-    fig.savefig(ruta, dpi=130); plt.close(fig)
-    return ruta
+    path = OUT/f'saga_fallas_cascada_{ts}.png'; fig.savefig(path, dpi=130); plt.close(fig)
+    return path
 
 
-def fig_fases(t: pd.DataFrame, ts: str) -> Path:
-    fig, axes = plt.subplots(1, 4, figsize=(23, 5))
-    x = np.arange(len(FASES)); w = 0.38
-    for ax, col, titulo, log in ((axes[0], "p50_s", "mediana de la latencia de cobro/matrícula (s)", True),
-                                 (axes[1], "p95_s", "p95 de la latencia de cobro/matrícula (s)", True),
-                                 (axes[2], "sonda_orq_p95_s", "p95 de GET /v1/sagas/{id} durante la falla (s)", True),
-                                 (axes[3], "pct_rapidas", "% de respuestas en < 200 ms (fail-fast)", False)):
-        for k, v in enumerate(VARIANTES):
-            s = t[t["variante"] == v].set_index("fase").reindex(FASES)
-            yerr = None
-            if col in ("p50_s", "p95_s"):
-                lo, hi = f"{col}_min", f"{col}_max"
-                yerr = [(s[col] - s[lo]).fillna(0).clip(lower=0), (s[hi] - s[col]).fillna(0).clip(lower=0)]
-            ax.bar(x + (k - 0.5) * w, s[col].fillna(0), w, color=COLOR[v], label=ETIQ[v], yerr=yerr, capsize=2, ecolor="#444")
-        ax.set_xticks(x); ax.set_xticklabels(FASES, rotation=25); ax.set_title(titulo, fontsize=10)
-        if log:
-            ax.set_yscale("log")
-    nreps = int(t["n_reps"].max())
-    axes[0].legend(fontsize=8)
-    fig.suptitle(f"Comparación por fase (mediana de {nreps} repetición(es); barras de error = rango entre repeticiones)")
+def fig_fases(t, ts):
+    phases = list(dict.fromkeys(t.fase))
+    fig, axes = plt.subplots(2, 2, figsize=(16,10))
+    for ax, (col, label) in zip(axes.flat, [('p95_s','p95 POST (s)'), ('pct_fail_fast_orq','Fail-fast Orq comprobado (%)'),
+                                          ('intentos_a_pagos','Intentos reales Orq→Pagos'), ('sonda_orq_p95_s','p95 lectura Orq (s)')]):
+        for j, variant in enumerate(VARIANTES):
+            rows = t[t.variante == variant].set_index('fase').reindex(phases)
+            ax.bar(np.arange(len(phases))+(j-.5)*.38, rows[col], .38, color=COLOR[variant], label=variant)
+        ax.set_xticks(np.arange(len(phases)), phases, rotation=55, ha='right'); ax.set_title(label); ax.legend(fontsize=8)
+    fig.suptitle('Medianas entre repeticiones; rangos de p95 en las tablas CSV')
     fig.tight_layout()
-    ruta = OUT / f"saga_fallas_fases_{ts}.png"
-    fig.savefig(ruta, dpi=130); plt.close(fig)
-    return ruta
+    path = OUT/f'saga_fallas_fases_{ts}.png'; fig.savefig(path, dpi=130); plt.close(fig)
+    return path
 
 
 def fig_antes_despues(esc: pd.DataFrame, ts: str) -> Path:
@@ -213,18 +215,6 @@ def fig_antes_despues(esc: pd.DataFrame, ts: str) -> Path:
     return ruta
 
 
-def _fmt(x, nd=2):
-    return "—" if pd.isna(x) else f"{x:.{nd}f}"
-
-
-def _rango(t, v, f, c, nd=2):
-    s = t[(t["variante"] == v) & (t["fase"] == f)]
-    if not len(s):
-        return "—"
-    lo, hi = s[f"{c}_min"].iloc[0], s[f"{c}_max"].iloc[0]
-    return _fmt(s[c].iloc[0], nd) if (pd.isna(lo) or abs(hi - lo) < 1e-9 or s["n_reps"].iloc[0] < 2) else f"{_fmt(s[c].iloc[0], nd)} (rango {_fmt(lo, nd)}–{_fmt(hi, nd)})"
-
-
 def _tiene_tabulate() -> bool:
     try:
         import tabulate  # noqa: F401
@@ -237,133 +227,81 @@ def _md(df: pd.DataFrame) -> str:
     return df.to_markdown(index=False) if _tiene_tabulate() else df.to_string(index=False)
 
 
-def _abre(mt: pd.DataFrame, col: str, fase: str, t_ini: float):
-    ab = mt[(mt["fase"] == fase) & (mt[col] == "OPEN")]
-    return float(ab["t"].iloc[0] - t_ini) if len(ab) else None
-
-
-def resumen(d: dict, t: pd.DataFrame, por_rep: pd.DataFrame, esc: pd.DataFrame | None, ts: str) -> Path:
-    nreps = int(t["n_reps"].max())
-    L = [f"# Resumen del experimento saga_fallas ({ts})", "",
-         f"Todas las cifras salen de los CSV crudos de `experiment/data/raw/` de esta corrida ({nreps} repetición(es) de cada variante; "
-         "las cifras de E3 son medianas y, con más de una repetición, se indica el rango). El texto no es una conclusión previa.", ""]
+def resumen(d, t, por_rep, esc, ts):
+    lines = [f'# Evidencia de cascada H6 ({ts})', '',
+        'Todas las cifras se calculan desde los CSV de esta corrida. Las tablas agregadas contienen medianas entre repeticiones; los CSV por repetición conservan dispersión y máximos.', '']
     if esc is not None:
-        L += ["## E1 y E2 — antes y después", ""]
-        for e in esc["escenario"].unique():
-            s = esc[(esc["escenario"] == e) & esc["saga"].notna()]
-            ok = int(s["invariantes_ok"].min()) if len(s) else 0
-            ant = esc[(esc["escenario"] == e) & (esc["momento"] == "antes")].iloc[0]
-            des = esc[(esc["escenario"] == e) & (esc["momento"] == "despues")].iloc[0]
-            L += [f"**{e}** ({len(s)} matrículas): invariantes {'OK' if ok else 'FALLAN'}. Cupos ocupados {int(ant['cupos_ocupados'])} → {int(des['cupos_ocupados'])}; "
-                  f"inscripciones confirmadas {int(ant['inscripciones_CONFIRMADA'])} → {int(des['inscripciones_CONFIRMADA'])}; pagos cobrados {int(ant['pagos_COBRADO'])} → {int(des['pagos_COBRADO'])}; "
-                  f"reembolsados {int(ant['pagos_REEMBOLSADO'])} → {int(des['pagos_REEMBOLSADO'])}. "
-                  f"Latencia de la solicitud (mediana) {s['latencia_solicitud_s'].median():.3f} s; del pago al estado final (mediana) {s['pago_a_estado_final_s'].median():.2f} s. "
-                  f"Pasos firmes de la última saga, en orden: `{s['pasos_firmes'].iloc[-1] if len(s) else '—'}`.", ""]
-    L += ["## E3 — falla en cascada contenida (misma línea de tiempo, con y sin patrón)", "",
-          "Fases: `antes` (sano) → `lenta` (Transbank 3 s) → `alivio` (sano; el circuito se cierra) → `bulkhead` (cobros directos a Pagos con Transbank a 1,2 s) → `pico` (saga completa, Transbank 3 s, muchos workers) → `caida` (Transbank caído) → `recuperacion`.", ""]
-    cols = ["variante", "fase", "workers", "peticiones", "req_por_s", "p50_s", "p95_s", "max_s", "pct_aceptadas", "pct_503", "pct_otros", "pct_rapidas",
-            "sonda_orq_p95_s", "sonda_orq_fallos", "sonda_ins_p95_s", "sonda_pagos_p95_s", "rechazos_bulkhead_orq", "rechazos_bulkhead_pagos",
-            "rechazos_circuito_tbk", "intentos_a_tbk"]
-    L += [_md(t[cols].round(2)), ""]
-
-    def g(v, f, c):
-        s = t[(t["variante"] == v) & (t["fase"] == f)]
-        return s[c].iloc[0] if len(s) else np.nan
-
-    L += ["### Lectura por fase (con patrón frente a sin patrón)", ""]
-    for f, nom in (("lenta", "Transbank lento (4 workers)"), ("pico", "Transbank lento + pico de carga"), ("caida", "Transbank caído")):
-        L += [f"- **{nom}.** Mediana de POST /v1/matriculas: {_rango(t, 'con_patron', f, 'p50_s')} s con patrón frente a {_rango(t, 'sin_patron', f, 'p50_s')} s sin patrón; "
-              f"p95 {_rango(t, 'con_patron', f, 'p95_s')} s frente a {_rango(t, 'sin_patron', f, 'p95_s')} s; "
-              f"respuestas en < 200 ms: {_fmt(g('con_patron', f, 'pct_rapidas'), 0)} % frente a {_fmt(g('sin_patron', f, 'pct_rapidas'), 0)} %; "
-              f"throughput {_fmt(g('con_patron', f, 'req_por_s'), 1)} frente a {_fmt(g('sin_patron', f, 'req_por_s'), 1)} peticiones/s. "
-              f"Sonda del orquestador (p95): {_fmt(g('con_patron', f, 'sonda_orq_p95_s'))} s frente a {_fmt(g('sin_patron', f, 'sonda_orq_p95_s'))} s; "
-              f"sonda de Inscripción, otro servicio (p95): {_fmt(g('con_patron', f, 'sonda_ins_p95_s'))} s frente a {_fmt(g('sin_patron', f, 'sonda_ins_p95_s'))} s."]
-    L += [f"- **Bulkhead aislado (cobros directos a Pagos con Transbank a 1,2 s, sin llegar al timeout).** Con patrón: {int(g('con_patron', 'bulkhead', 'rechazos_bulkhead_pagos'))} cobros rechazados por el bulkhead "
-          f"({_fmt(g('con_patron', 'bulkhead', 'pct_rapidas'), 0)} % de las respuestas en < 200 ms), `GET /v1/health` de Pagos en p95 {_fmt(g('con_patron', 'bulkhead', 'sonda_pagos_p95_s'))} s y "
-          f"{_fmt(g('con_patron', 'bulkhead', 'req_por_s'), 1)} peticiones/s. Sin patrón: {int(g('sin_patron', 'bulkhead', 'rechazos_bulkhead_pagos'))} rechazos; "
-          f"{_fmt(g('sin_patron', 'bulkhead', 'pct_rapidas'), 0)} % de respuestas rápidas, `GET /v1/health` de Pagos en p95 {_fmt(g('sin_patron', 'bulkhead', 'sonda_pagos_p95_s'))} s y p95 de los cobros "
-          f"{_fmt(g('sin_patron', 'bulkhead', 'p95_s'))} s (con patrón {_fmt(g('con_patron', 'bulkhead', 'p95_s'))} s).", ""]
-
-    # --- circuitos, por repetición
-    for v in VARIANTES:
-        partes = []
-        for fase in ("lenta", "pico"):
-            tiempos = []
-            for rep in sorted(d["fases"][d["fases"]["variante"] == v]["rep"].unique()):
-                _, _, mt, fs = _sel(d, v, rep)
-                t_ini = float(fs[fs["fase"] == fase]["t_ini"].iloc[0])
-                tiempos.append(_abre(mt, "pagos_cb", fase, t_ini))
-            ab = [x for x in tiempos if x is not None]
-            partes.append(f"circuito Pagos→Transbank en `{fase}`: " + (f"abrió en {len(ab)} de {len(tiempos)} repeticiones (mediana {np.median(ab):.1f} s tras iniciar la fase)" if ab else "nunca abrió"))
-        for fase in ("lenta", "pico", "caida"):
-            r = t[(t["variante"] == v) & (t["fase"] == fase)].iloc[0]
-            partes.append(f"`{fase}`: {int(r['intentos_a_tbk'])} intentos a Transbank, {int(r['rechazos_circuito_tbk'])} frenados por el circuito y {int(r['rechazos_bulkhead_pagos'])} por el bulkhead de Pagos")
-        L += [f"- **{ETIQ[v]}** — " + "; ".join(partes) + "."]
-
-    # --- hallazgos detectados en los datos
-    L += ["", "### Hallazgos que surgen de esta corrida", ""]
-    hall = []
-    sin_abrir, total, fases_orq = 0, 0, set()
-    for rep in sorted(d["fases"][d["fases"]["variante"] == "con_patron"]["rep"].unique()):
-        _, _, mt, fs = _sel(d, "con_patron", rep)
-        t_len = float(fs[fs["fase"] == "lenta"]["t_ini"].iloc[0])
-        if _abre(mt, "pagos_cb", "lenta", t_len) is not None:
-            total += 1
-            sin_abrir += _abre(mt, "orq_cb_COBRAR", "lenta", t_len) is None
-        fases_orq |= set(mt[mt["orq_cb_COBRAR"] == "OPEN"]["fase"].unique())
-    if sin_abrir:
-        donde = (f"Solo abrió en fases con ráfagas de fallas simultáneas ({', '.join(f for f in FASES if f in fases_orq)})." if fases_orq
-                 else "No abrió en ninguna fase.")
-        hall.append(f"**El circuito Orquestador→Pagos no abrió con carga secuencial** (fase `lenta`, 4 workers) en {sin_abrir} de {total} repeticiones, aunque el de Pagos→Transbank sí. {donde} "
-                    "Causa identificada en el código (`saga_clients.Client.call`): el cobro y su compensación comparten un mismo breaker y el reembolso, que responde bien porque no pasa por Transbank, "
-                    "cuenta como éxito y reinicia el contador de fallas consecutivas (solo se supera el umbral cuando llegan ≥ 5 fallas antes de que cualquier compensación termine). "
-                    "Lo reproduce de forma aislada `tests/unit/test_saga_pago.py` (xfail estricto). Consecuencia: con carga baja el orquestador sigue reservando y liberando cupo por cada matrícula fallida en vez de fallar rápido sin reservar.")
-    bkc = int(g("con_patron", "bulkhead", "rechazos_bulkhead_pagos"))
-    if bkc > 0:
-        hall.append(f"**El bulkhead de Pagos sí actuó (fase `bulkhead`):** con patrón rechazó {bkc} cobros que habrían ocupado hilos esperando a un Transbank lento; "
-                    f"el `GET /v1/health` de Pagos tardó p95 {_fmt(g('con_patron', 'bulkhead', 'sonda_pagos_p95_s'))} s frente a {_fmt(g('sin_patron', 'bulkhead', 'sonda_pagos_p95_s'))} s sin patrón.")
-    else:
-        hall.append("**El bulkhead de Pagos no llegó a rechazar nada** en esta corrida: la carga no superó su capacidad. Su efecto no está demostrado por estos datos.")
-    if float(por_rep[por_rep["variante"] == "con_patron"]["rechazos_bulkhead_orq"].sum()) == 0:
-        hall.append("**El bulkhead del orquestador no rechazó nada** en esta corrida: ninguna dependencia superó 8 llamadas simultáneas, así que no se evalúa aquí; "
-                    "el hallazgo de que compensa sagas sanas se prueba con `experiment/scripts/saga_integridad_bulkhead.py`.")
-    else:
-        hall.append(f"**El bulkhead del orquestador sí rechazó** ({int(por_rep[por_rep['variante'] == 'con_patron']['rechazos_bulkhead_orq'].sum())} llamadas en total, con patrón): "
-                    "cada rechazo se trata como falla incierta y compensa la matrícula (hallazgo abierto). Aquí ocurrió con Pagos lento; el mismo mecanismo rechaza también sagas sanas "
-                    "bajo concurrencia (se prueba con `experiment/scripts/saga_integridad_bulkhead.py`).")
-    hall.append(f"**Una caída inmediata es barata de manejar; la lentitud es la peligrosa.** Con Transbank caído la matrícula respondió en p95 {_rango(t, 'con_patron', 'caida', 'p95_s')} s con patrón y "
-                f"{_rango(t, 'sin_patron', 'caida', 'p95_s')} s sin patrón: un error rápido no necesita circuito para ser rápido. El circuito aporta ahí otra cosa: dejó de llamar a Transbank "
-                f"({int(g('con_patron', 'caida', 'intentos_a_tbk'))} intentos frente a {int(g('sin_patron', 'caida', 'intentos_a_tbk'))}).")
-    pp = por_rep[(por_rep["variante"] == "con_patron") & (por_rep["fase"] == "pico")]["p50_s"]
-    if len(pp) and pp.max() > 5 * max(pp.min(), 0.005):
-        hall.append(f"**La mediana del pico con patrón varía mucho entre repeticiones ({pp.min():.2f}–{pp.max():.2f} s).** Depende de si el circuito del orquestador alcanza a abrir durante la ráfaga: "
-                    "cuando abre, las matrículas fallan rápido sin reservar; cuando no, cada una sigue reservando y liberando cupo y compite por las escrituras serializadas de la SQLite del orquestador. "
-                    "Una sola corrida no basta para afirmar un valor; use `--repeticiones`.")
-    L += [f"{i}. {h}" for i, h in enumerate(hall, 1)]
-
-    L += ["", "### Estado final tras la falla (convergencia e invariantes)", ""]
-    for v in VARIANTES:
-        for rep in sorted(d["estados"][d["estados"]["variante"] == v]["rep"].unique()):
-            fin = d["estados"][(d["estados"]["variante"] == v) & (d["estados"]["rep"] == rep) & (d["estados"]["momento"] == "final")].iloc[0]
-            conv = "no convergió en el tiempo de drenaje" if fin["convergencia_s"] < 0 else f"convergió en {fin['convergencia_s']:.1f} s"
-            L += [f"- **{ETIQ[v]}, repetición {rep}:** {conv}; sagas en vuelo {int(fin['sagas_en_vuelo'])}; COMPLETADA {int(fin['sagas_COMPLETADA'])}, ESPERANDO_PAGO {int(fin['sagas_ESPERANDO_PAGO'])}, "
-                  f"COMPENSADA {int(fin['sagas_COMPENSADA'])}, COMPENSACION_PENDIENTE {int(fin['sagas_COMPENSACION_PENDIENTE'])}; "
-                  f"**cupos huérfanos {int(fin['cupos_huerfanos'])}**, **cobros huérfanos {int(fin['cobros_huerfanos'])}**."]
-    L += ["", "## Límites de esta evidencia", "",
-          f"- {nreps} repetición(es) por variante: las cifras absolutas varían con la máquina y entre corridas; importa la comparación entre variantes y el comportamiento por fase.",
-          "- Transbank y el comprador están simulados; la latencia y la caída se inducen en Pagos (`PUT /internal/fault`), no en el Transbank real.",
-          "- Todo corre en una máquina con SQLite y un solo proceso por servicio; el hilo de uvicorn (40) es el recurso que se satura sin bulkhead.",
-          "- 'Sin patrón' deja circuito y bulkhead inertes pero conserva los timeouts (2 s la saga, 1,5 s hacia Transbank): aísla el efecto de esos dos patrones.",
-          "- La fase `bulkhead` carga directamente a Pagos (no pasa por la saga) para aislar el bulkhead del circuito; la fase `pico` carga la saga completa.",
-          "- Las matrículas de E3 quedan en `ESPERANDO_PAGO` (el comprador no paga): miden la reserva y el cobro pendiente, no la inscripción."]
-    ruta = OUT / f"resumen_saga_fallas_{ts}.md"
-    ruta.write_text("\n".join(L) + "\n", encoding="utf-8")
-    return ruta
+        lines += ['## E1/E2: éxito y compensación después del pago', '']
+        for scenario in esc.escenario.unique():
+            rows = esc[(esc.escenario == scenario) & esc.saga.notna()]
+            lines += [f'- {scenario}: {len(rows)} matrículas; invariantes OK={int(rows.invariantes_ok.min())}; pasos `{rows.pasos_firmes.iloc[-1]}`.', '']
+    slow = t[t.fase == 'pagos_lento'].set_index('variante')
+    if set(VARIANTES) <= set(slow.index):
+        con, sin = slow.loc['con_patron'], slow.loc['sin_patron']
+        lines += ['## Resultado principal: lentitud aislada de Pagos', '',
+            f"Medianas de las repeticiones: {con.pct_fail_fast_orq:.1f}% de fail-fast comprobado con patrón; "
+            f"{con.intentos_a_pagos:.0f} intentos reales de crear pago frente a {sin.intentos_a_pagos:.0f} sin patrón. "
+            f"p50 de la solicitud {con.p50_s:.3f} s frente a {sin.p50_s:.3f} s; p95 {con.p95_s:.3f} s frente a {sin.p95_s:.3f} s. "
+            f"Ocupación máxima muestreada de cobros en el orquestador: {con.orq_cobros_en_vuelo_max:.0f} frente a {sin.orq_cobros_en_vuelo_max:.0f}.", '',
+            'El circuito reduce los intentos después del umbral; las primeras llamadas aún pagan el timeout. La p95 puede seguir cerca del timeout si esas llamadas superan el 5% de solicitudes. La carga de bucle cerrado ofrece más solicitudes cuando el rechazo es rápido, por lo que no se comparan volúmenes como si fueran una tasa fija de llegada.', '']
+    fields = [c for c in ('variante','fase','workers','pagos_latencia_ms','tbk_latencia_ms','tbk_caido','saga_timeout_s','tbk_timeout_s','comprador') if c in d['fases']]
+    lines += ['', '## Parámetros efectivamente ejecutados', '', _md(d['fases'][fields].drop_duplicates()), '',
+        'Las variantes conservan los timeouts. Sin patrón usa umbral y capacidad elevados; conserva idempotencia, callbacks, reconciliación y timeouts.', '',
+        '## Comparación por fase', '', _md(t[[c for c in ('variante','fase','n_reps','peticiones','p50_s','p95_s','p95_s_min','p95_s_max','pct_429','pct_fail_fast_orq','intentos_a_pagos','compensaciones_orq','orq_cobros_en_vuelo_max','rechazos_admision_orq','intentos_a_tbk','sonda_orq_p95_s') if c in t]].round(3)), '',
+        'Fail-fast del orquestador exige HTTP 503, motivo PAGOS_CIRCUITO_ABIERTO y latencia <200 ms. El porcentaje de respuestas rápidas incluye éxitos y otros rechazos: se conserva separado. Intentos y compensaciones son deltas entre límites de fase; ocupación es el máximo muestreado de cobros simultáneos, no CPU.', '',
+        '## Apertura por frontera y recuperación', '']
+    for phase in d['fases'].fase.unique():
+        for variant in VARIANTES:
+            metrics = d['metricas'][(d['metricas'].variante == variant) & (d['metricas'].fase == phase)]
+            n = d['fases'].loc[(d['fases'].variante == variant) & (d['fases'].fase == phase), 'rep'].nunique()
+            opened = metrics.loc[metrics.orq_cb_COBRAR == 'OPEN', 'rep'].nunique()
+            inner = metrics.loc[metrics.pagos_cb == 'OPEN', 'rep'].nunique()
+            lines += [f'- {variant}, {phase}: Orquestador→Pagos (crear) abrió en {opened} de {n} repeticiones; Pagos→Transbank abrió en {inner} de {n}.']
+            if not opened and variant == 'con_patron':
+                lines += [f'  El circuito Orquestador→Pagos no abrió en esta fase; no se atribuye a él contención observada en la otra frontera.']
+    cols = [c for c in d['metricas'] if c.startswith('orq_cb_COBRAR_')]
+    if cols:
+        lines += ['', 'Estados observados por operación:', '', _md(d['metricas'].groupby(['variante','rep'])[cols].agg(lambda s: ','.join(sorted(s.dropna().unique()))).reset_index())]
+    rq = d['requests']
+    if 'fail_fast_sin_efectos' in rq:
+        ff = rq[rq.motivo_fallo == 'PAGOS_CIRCUITO_ABIERTO']
+        lines += ['', f'Rechazos por circuito de Pagos verificados por saga: {len(ff)}; sin pasos firmes ni peticiones a Pagos: {int((ff.fail_fast_sin_efectos == 1).sum())}.', '']
+    if 'estado_final' in rq:
+        for phase in ('pagos_recuperacion', 'recuperacion'):
+            for variant in VARIANTES:
+                metrics = d['metricas'][(d['metricas'].variante == variant) & (d['metricas'].fase == phase)]
+                for rep, group in metrics.groupby('rep'):
+                    closed = group.sort_values('t').iloc[-1].orq_cb_COBRAR
+                    completed = rq[(rq.variante == variant) & (rq.rep == rep) & (rq.fase == phase) & (rq.estado_final == 'COMPLETADA')]
+                    lines += [f'- Recuperación {phase}, {variant}, rep {rep}: circuito de creación termina {closed}; {len(completed)} matrículas COMPLETADA de esta fase.']
+        lines += ['', 'Resultados de Saga por fase de origen (estado observado al terminar el drenaje):', '',
+                  _md(rq[rq.destino == 'matriculas'].groupby(['variante','rep','fase','estado_final']).size().rename('sagas').reset_index())]
+    lines += ['', 'Bulkhead aislado: la fase de carga directa a Pagos cancela cada pago por su clave, incluso después de un timeout. No representa una matrícula y se etiqueta como destino pagos.', '',
+              '## Estado final y cierre de negocio', '']
+    for _, row in d['estados'][d['estados'].momento == 'final'].iterrows():
+        lines += [f"- {row.variante}, repetición {row.rep}: convergencia {row.convergencia_s} s (negativo = sin cierre); COMPLETADA {int(row.sagas_COMPLETADA)}, ESPERANDO_PAGO {int(row.sagas_ESPERANDO_PAGO)}, COMPENSADA {int(row.sagas_COMPENSADA)}, COMPENSACION_PENDIENTE {int(row.sagas_COMPENSACION_PENDIENTE)}; cupos huérfanos {int(row.cupos_huerfanos)}, cobros huérfanos {int(row.cobros_huerfanos)}."]
+    missing = [c for c in ('orq_intentos_COBRAR_forward','orq_admision_rech','pagos_tbk_intentos') if c not in d['metricas'] or d['metricas'][c].isna().any()]
+    lines += ['', '## Límites y calidad de la medición', '',
+        f'- Telemetría requerida ausente: {", ".join(missing) if missing else "ninguna"}. Valores ausentes se mantienen desconocidos; un contador que disminuye invalida el cálculo y detiene el informe.',
+        '- Transbank y el comprador son simulados. En Pagos lento, un proxy experimental retrasa únicamente POST /v1/payments; reembolsos y consultas llegan al servicio real. El proxy registra incluso llamadas que continúan después del timeout. Ambas variantes usan el mismo proxy.',
+        '- El comprador intenta aprobar los pagos aceptados. El drenaje exige cero ESPERANDO_PAGO, pagos pendientes y llamadas activas; si no se alcanza, el informe declara falta de cierre.',
+        '- Procesos locales en una máquina, bases SQLite independientes, un proceso por servicio; no mide Kubernetes, PostgreSQL bajo carga, red distribuida ni Webpay real.',
+        '- Carga de bucle cerrado: cada worker espera respuesta y comprador/cancelación antes de pausar y repetir. El volumen admitido difiere entre variantes; comparar también intentos y ocupación, sin atribuir throughput a igual tasa de llegada.',
+        '- HALF_OPEN puede durar menos que el intervalo de muestreo de 0,5 s. La transición controlada se verifica en tests H2; la corrida demuestra recuperación mediante CLOSED y matrículas completas posteriores.',
+        '- No se deducen causas de código desde un estado de circuito aislado. CSV históricos conservan sus conclusiones originales y no sustituyen esta evidencia.', '']
+    path = OUT/f'resumen_saga_fallas_{ts}.md'; path.write_text('\n'.join(lines), encoding='utf-8')
+    return path
 
 
 def generar(ts: str | None = None) -> None:
     ts = ts or _ultimo_ts()
     OUT.mkdir(exist_ok=True)
+    manifest_path = RAW/f'saga_fallas_{ts}_manifest.json'
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        for filename, digest in manifest.get('dataset_sha256', {}).items():
+            if hashlib.sha256((RAW/filename).read_bytes()).hexdigest() != digest:
+                raise ValueError(f'CSV modificado desde la medición: {filename}')
     esc = _leer(ts, "escenarios")
     d = {k: _leer(ts, k) for k in ("requests", "sondas", "metricas", "fases", "estados")}
     print(f"Generando figuras y tablas de saga_fallas {ts}…")

@@ -284,7 +284,7 @@ El repositorio se monta en `/repo` en los ejecutores, lo que permite reflejar ca
 
 ### Experimento de la saga con Pagos (Unidad 3)
 
-`experiment/scripts/saga_fallas.py` ejecuta los tres escenarios del encargo (éxito, falla del último paso, cascada contenida con Transbank lento, pico y caída) y genera la evidencia antes/después y la comparación **con y sin Circuit Breaker/Bulkhead** (CSV, figuras y resumen interpretado). Ver [`experiment/README.md`](experiment/README.md#experimento-saga_fallas-unidad-3-evidencia-antes-y-después-de-los-tres-escenarios).
+`experiment/scripts/saga_fallas.py` ejecuta los tres escenarios del encargo (éxito, falla del último paso, cascada con lentitud aislada de Pagos, Transbank lento, pico, caída y recuperación) y genera la evidencia antes/después y la comparación **con y sin Circuit Breaker/Bulkhead** (CSV, figuras y resumen interpretado). Ver [`experiment/README.md`](experiment/README.md#experimento-saga_fallas-unidad-3-evidencia-antes-y-después-de-los-tres-escenarios).
 
 ## Historial de versiones de los contratos
 

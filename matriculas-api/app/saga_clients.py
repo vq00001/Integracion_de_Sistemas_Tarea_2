@@ -53,12 +53,14 @@ class Client:
         self.seconds = 0.0
         self.calls = 0
         self.lock = threading.Lock()
+        self.attempts = dict.fromkeys(self.breakers, 0)
+        self.in_flight = dict.fromkeys(self.breakers, 0)
 
     @property
     def available(self):
         return self.breaker.state != CircuitState.OPEN
 
-    def call(self, fn, *args, breaker=None, semaphore=None):
+    def call(self, fn, *args, breaker=None, semaphore=None, operation="forward"):
         breaker = self.breaker if breaker is None else breaker
         semaphore = self.semaphore if semaphore is None else semaphore
         if not semaphore.acquire(blocking=False):
@@ -66,9 +68,14 @@ class Client:
                 self.rejected += 1
             raise LocalRejection("Bulkhead lleno")
         start = time.monotonic()
+        sent = False
         try:
             if not breaker.allow_request():
                 raise LocalRejection("Circuito abierto")
+            with self.lock:
+                self.attempts[operation] += 1
+                self.in_flight[operation] += 1
+                sent = True
             try:
                 result = fn(*args, timeout=self.timeout)
             except BusinessError:
@@ -81,6 +88,8 @@ class Client:
             return result
         finally:
             with self.lock:
+                if sent:
+                    self.in_flight[operation] -= 1
                 self.seconds += time.monotonic()-start
                 self.calls += 1
             semaphore.release()
@@ -90,12 +99,12 @@ class Client:
 
     def compensate(self, saga, key, original):
         return self.call(self.compensation, saga, key, original,
-                         breaker=self.breakers["compensacion"], semaphore=self.semaphores["compensacion"])
+                         breaker=self.breakers["compensacion"], semaphore=self.semaphores["compensacion"], operation="compensacion")
 
     def query(self, saga, key):
         """Consulta con circuito y capacidad propios, sin desplazar cobros ni reembolsos."""
         return self.call(self.inquiry, saga, key, breaker=self.breakers["consulta"],
-                         semaphore=self.semaphores["consulta"])
+                         semaphore=self.semaphores["consulta"], operation="consulta")
 
 
 def http(method, url, payload, key, timeout, internal=False, api_key=None, enrollment_writer=False):

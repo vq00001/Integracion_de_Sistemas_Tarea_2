@@ -1,0 +1,385 @@
+{
+  "ts": "20261124_H6",
+  "invocations": [
+    {
+      "ts": "20261124_H6",
+      "source_sha256": "c7922df10bd159ae90818fe472c6847f5ddabf7d0a9d1fc6a0c1ad4dc5374fc1",
+      "git_head": "307f41ef5d3a88ee0ea645d441f390ca098c578d",
+      "git_status": " M docs/saga.md\n M experiment/graficar_saga_fallas.py\n M experiment/scripts/saga_fallas.py\n M matriculas-api/app/orchestrator_main.py\n M matriculas-api/app/saga.py\n M matriculas-api/app/saga_clients.py\n M tests/unit/test_h6_evidencia_cascada.py\n M tests/unit/test_saga_fallas_experimento.py\n?? experiment/data/raw/saga_fallas_20261124_H6_escenarios.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_manifest.json\n?? experiment/support/\n",
+      "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+      "argv": [
+        "--solo-cascada",
+        "--repeticiones",
+        "3",
+        "--ts",
+        "20261124_H6",
+        "--sin-graficar"
+      ],
+      "patrones": {
+        "con_patron": {
+          "SAGA_BULKHEAD": "8",
+          "SAGA_CB_THRESHOLD": "5",
+          "PAGOS_BULKHEAD": "8",
+          "PAGOS_CB_THRESHOLD": "5"
+        },
+        "sin_patron": {
+          "SAGA_BULKHEAD": "100000",
+          "SAGA_CB_THRESHOLD": "1000000",
+          "PAGOS_BULKHEAD": "100000",
+          "PAGOS_CB_THRESHOLD": "1000000"
+        }
+      },
+      "fases": [
+        {
+          "nombre": "antes",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_lento",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "pagos",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_recuperacion",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "lenta",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "alivio",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "bulkhead",
+          "segundos": 6,
+          "workers": 24,
+          "think": 0.2,
+          "latencia_ms": 1200,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "pagos"
+        },
+        {
+          "nombre": "pico",
+          "segundos": 8,
+          "workers": 16,
+          "think": 0.3,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "caida",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": true,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "recuperacion",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        }
+      ],
+      "timeout_saga_s": 2,
+      "timeout_tbk_s": 1.5
+    },
+    {
+      "ts": "20261124_H6",
+      "started_at": "2026-11-24T19:07:26.310629+00:00",
+      "source_sha256": "a851af0b89616785033c12c56404597cadc6d49f20a4ec08cc257f5ebfb4a4e0",
+      "git_head": "307f41ef5d3a88ee0ea645d441f390ca098c578d",
+      "git_status": " M docs/saga.md\n M experiment/README.md\n M experiment/graficar_saga_fallas.py\n M experiment/scripts/saga_fallas.py\n M matriculas-api/app/orchestrator_main.py\n M matriculas-api/app/saga.py\n M matriculas-api/app/saga_clients.py\n M tests/unit/test_h6_evidencia_cascada.py\n M tests/unit/test_saga_fallas_experimento.py\n?? experiment/data/raw/saga_fallas_20261124_H6_escenarios.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_estados.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_fases.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_frontera.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_manifest.json\n?? experiment/data/raw/saga_fallas_20261124_H6_metricas.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_requests.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_sondas.csv\n?? experiment/support/\n",
+      "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+      "argv": [
+        "--solo-cascada",
+        "--desde-rep",
+        "1",
+        "--repeticiones",
+        "1",
+        "--ts",
+        "20261124_H6"
+      ],
+      "patrones": {
+        "con_patron": {
+          "SAGA_BULKHEAD": "8",
+          "SAGA_CB_THRESHOLD": "5",
+          "PAGOS_BULKHEAD": "8",
+          "PAGOS_CB_THRESHOLD": "5"
+        },
+        "sin_patron": {
+          "SAGA_BULKHEAD": "100000",
+          "SAGA_CB_THRESHOLD": "1000000",
+          "PAGOS_BULKHEAD": "100000",
+          "PAGOS_CB_THRESHOLD": "1000000"
+        }
+      },
+      "fases": [
+        {
+          "nombre": "antes",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_lento",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "pagos",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_recuperacion",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "lenta",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "alivio",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "bulkhead",
+          "segundos": 6,
+          "workers": 24,
+          "think": 0.2,
+          "latencia_ms": 1200,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "pagos"
+        },
+        {
+          "nombre": "pico",
+          "segundos": 8,
+          "workers": 16,
+          "think": 0.3,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "caida",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": true,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "recuperacion",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        }
+      ],
+      "timeout_saga_s": 2,
+      "timeout_tbk_s": 1.5
+    },
+    {
+      "ts": "20261124_H6",
+      "started_at": "2026-11-24T19:12:18.815467+00:00",
+      "source_sha256": "61e60b5d6e8698964903cd56bfff4d15d8663c201f7f083830bf715e122a1d34",
+      "git_head": "307f41ef5d3a88ee0ea645d441f390ca098c578d",
+      "git_status": " M README.md\n M docs/saga.md\n M experiment/README.md\n M experiment/graficar_saga_fallas.py\n M experiment/scripts/saga_fallas.py\n M matriculas-api/app/orchestrator_main.py\n M matriculas-api/app/saga.py\n M matriculas-api/app/saga_clients.py\n M tests/unit/test_h6_evidencia_cascada.py\n M tests/unit/test_saga_fallas_experimento.py\n?? experiment/data/raw/saga_fallas_20261124_H6_escenarios.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_estados.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_fases.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_frontera.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_manifest.json\n?? experiment/data/raw/saga_fallas_20261124_H6_metricas.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_requests.csv\n?? experiment/data/raw/saga_fallas_20261124_H6_sondas.csv\n?? experiment/results/resumen_saga_fallas_20261124_H6.md\n?? experiment/results/saga_fallas_antes_despues_20261124_H6.png\n?? experiment/results/saga_fallas_cascada_20261124_H6.png\n?? experiment/results/saga_fallas_fases_20261124_H6.md\n?? experiment/results/saga_fallas_fases_20261124_H6.png\n?? experiment/support/\n",
+      "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+      "argv": [
+        "--solo-base",
+        "--repeticiones-base",
+        "3",
+        "--ts",
+        "20261124_H6"
+      ],
+      "patrones": {
+        "con_patron": {
+          "SAGA_BULKHEAD": "8",
+          "SAGA_CB_THRESHOLD": "5",
+          "PAGOS_BULKHEAD": "8",
+          "PAGOS_CB_THRESHOLD": "5"
+        },
+        "sin_patron": {
+          "SAGA_BULKHEAD": "100000",
+          "SAGA_CB_THRESHOLD": "1000000",
+          "PAGOS_BULKHEAD": "100000",
+          "PAGOS_CB_THRESHOLD": "1000000"
+        }
+      },
+      "fases": [
+        {
+          "nombre": "antes",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_lento",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "pagos",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "pagos_recuperacion",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "lenta",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "alivio",
+          "segundos": 8,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "bulkhead",
+          "segundos": 6,
+          "workers": 24,
+          "think": 0.2,
+          "latencia_ms": 1200,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "pagos"
+        },
+        {
+          "nombre": "pico",
+          "segundos": 8,
+          "workers": 16,
+          "think": 0.3,
+          "latencia_ms": 3000,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "caida",
+          "segundos": 4,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": true,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        },
+        {
+          "nombre": "recuperacion",
+          "segundos": 10,
+          "workers": 4,
+          "think": 0.15,
+          "latencia_ms": 0,
+          "falla": false,
+          "falla_en": "transbank",
+          "destino": "matriculas"
+        }
+      ],
+      "timeout_saga_s": 2,
+      "timeout_tbk_s": 1.5
+    }
+  ],
+  "dataset_sha256": {
+    "saga_fallas_20261124_H6_escenarios.csv": "2af059a60b198e6ceee8f9121ecd672cbaac00f9f24b23256c6f6459113fad0d",
+    "saga_fallas_20261124_H6_estados.csv": "7b51af5483db8a110400c40c4536ab21e21df7965306979f02aabf07c9a27136",
+    "saga_fallas_20261124_H6_fases.csv": "026825e18c5bd223dca320e836134f693f01e07264a3fdd8197e30c94a127582",
+    "saga_fallas_20261124_H6_frontera.csv": "8cca5c7b69919a5f324de94e3603f416ee5cf62e9edfc3cebf7f1c3c34e9fad4",
+    "saga_fallas_20261124_H6_metricas.csv": "f3ff9dfd0dbea6f67b976ef0ab06062b0414f92ae411c62e98b3a5c08f64a649",
+    "saga_fallas_20261124_H6_requests.csv": "b6fe3ea9b57f1778c441475fe2601d130fb17a7e36418163efd2cb73a9d401b7",
+    "saga_fallas_20261124_H6_sondas.csv": "dce999d924d2ca0626be86c7180329c4e60c856c4f671b36a12107fb76331121"
+  }
+}

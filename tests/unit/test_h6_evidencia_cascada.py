@@ -50,6 +50,7 @@ def launches(exp, monkeypatch):
     recorded, stacks = {}, []
     monkeypatch.setenv('INSCRIPCION_WRITER_KEY', 'host-writer-key-que-no-debe-heredarse')
     monkeypatch.setattr(exp.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(exp.PagosProxy, 'start', lambda self: self)
     monkeypatch.setattr(exp.Stack, '_esperar', lambda *a: None)
     monkeypatch.setattr(exp.Stack, '_ampliar_cupos', lambda *a: None)
     def start(variant):
@@ -63,6 +64,8 @@ def launches(exp, monkeypatch):
         return envs
     yield start
     for stack in stacks:
+        stack.proxy.stop()
+        stack.fake.server.server_close()
         shutil.rmtree(stack.W)
 
 
@@ -428,3 +431,59 @@ def test_h6_pagos_pendientes_no_se_presentan_como_negocio_cerrado(exp, monkeypat
     assert final['sagas_ESPERANDO_PAGO'] == 1
     assert final.get('negocio_cerrado') is False or final['convergencia_s'] < 0, (
         'El drenaje operativo no demuestra cierre de negocio cuando aún se espera al comprador')
+
+
+def test_h6_proxy_conserva_envio_tardio_y_no_demora_compensacion():
+    """La inyección no convierte un timeout incierto en una cancelación ficticia."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from experiment.support.pagos_proxy import PagosProxy
+    created, refunded = threading.Event(), threading.Event()
+    class Backend(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get('Content-Length', '0')))
+            if self.path.endswith('/refund'):
+                refunded.set()
+            else:
+                created.set()
+            body = json.dumps({'estado': 'CANCELADO' if refunded.is_set() else 'PENDIENTE'}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Backend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    proxy = PagosProxy(f'http://127.0.0.1:{server.server_port}').start()
+    try:
+        proxy.configure(350, 'pagos_lento')
+        with pytest.raises(requests.Timeout):
+            requests.post(proxy.url+'/v1/payments', json={}, headers={'Idempotency-Key': 's:COBRAR'}, timeout=.05)
+        assert not created.is_set()
+        result = requests.post(proxy.url+'/v1/payments/refund', json={},
+                               headers={'Idempotency-Key': 's:comp:COBRAR'}, timeout=1)
+        assert result.json()['estado'] == 'CANCELADO'
+        assert created.wait(2), 'Un cliente desconectado no debe borrar la petición tardía del experimento'
+    finally:
+        proxy.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+    events = {e['operacion']: e for e in proxy.events}
+    assert set(events) == {'forward', 'compensacion'}
+    assert events['compensacion']['enviado'] < events['forward']['enviado']
+    assert events['forward']['codigo'] == 200
+    assert all(e['fase'] == 'pagos_lento' for e in events.values())
+
+
+def test_h6_informe_rechaza_csv_alterado_tras_la_medicion(graf, tmp_path, monkeypatch):
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    csv = raw / 'saga_fallas_integridad_requests.csv'
+    csv.write_text('datos alterados', encoding='utf-8')
+    manifest = {'dataset_sha256': {csv.name: 'hash-de-la-medicion-original'}}
+    (raw / 'saga_fallas_integridad_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+    monkeypatch.setattr(graf, 'RAW', raw)
+    with pytest.raises(ValueError, match='CSV modificado'):
+        graf.generar('integridad')

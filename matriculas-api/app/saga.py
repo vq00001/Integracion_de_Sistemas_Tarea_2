@@ -131,6 +131,8 @@ class Orchestrator:
         if capacity < 1:
             raise ValueError("SAGA_BULKHEAD debe ser mayor que cero")
         self.admission = threading.BoundedSemaphore(capacity)
+        self.metrics_lock = threading.Lock()
+        self.admission_rejected = 0
 
     def transition(self, db, saga, state, step=None, duration=0):
         if step is None:
@@ -164,6 +166,8 @@ class Orchestrator:
                 previous = self._replay(db, key, digest)
                 if previous is not None:
                     return previous, True
+                with self.metrics_lock:
+                    self.admission_rejected += 1
                 raise TooManyRequestsError("Capacidad de sagas agotada; reintenta con la misma clave")
             try:
                 saga = Saga(idempotency_key=key, request_hash=digest, **payload)
