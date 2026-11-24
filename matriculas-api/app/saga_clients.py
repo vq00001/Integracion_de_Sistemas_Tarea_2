@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import grpc
@@ -24,8 +25,9 @@ class DependencyFailure(Exception):
 
 
 class Client:
-    def __init__(self, operation, compensation, timeout=2, capacity=8, threshold=5, recovery=15):
+    def __init__(self, operation, compensation, timeout=2, capacity=8, threshold=5, recovery=15, inquiry=None):
         self.operation, self.compensation, self.timeout = operation, compensation, timeout
+        self.inquiry = inquiry
         self.breaker = CircuitBreaker(threshold, recovery)
         self.semaphore = threading.BoundedSemaphore(capacity)
         self.rejected = 0
@@ -68,13 +70,20 @@ class Client:
     def compensate(self, saga, key, original):
         return self.call(self.compensation, saga, key, original)
 
+    def query(self, saga, key):
+        """Consulta de solo lectura al servicio (pasa por el mismo circuito y bulkhead)."""
+        return self.call(self.inquiry, saga, key)
 
-def http(method, url, payload, key, timeout, internal=False):
-    headers = {"Content-Type": "application/json", "Idempotency-Key": key,
-               "X-API-Key": os.environ.get("SERVICE_API_KEY", "").split(",")[0].strip()}
+
+def http(method, url, payload, key, timeout, internal=False, api_key=None):
+    """`api_key` es la credencial DEL DESTINO: Pagos recibe PAGOS_API_KEY y nunca la clave de Inscripción."""
+    if api_key is None:
+        api_key = os.environ.get("SERVICE_API_KEY", "").split(",")[0].strip()
+    headers = {"Content-Type": "application/json", "Idempotency-Key": key, "X-API-Key": api_key}
     if internal:
         headers["X-Internal-Key"] = os.environ.get("INTERNAL_KEY", "")
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method=method)
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.load(response)
@@ -120,21 +129,34 @@ def clients_from_env():
         return http("POST", ins+"/internal/enrollments/cancel",
                     dict(student_id=s["alumno_id"], curso_id=s["curso_id"]), original, timeout, internal=True)
 
+    def pay_key():
+        return os.environ.get("PAGOS_API_KEY", "")
+
     def charge(s, key, timeout):
-        result = http("POST", pay+"/v1/payments", dict(alumno_id=s["alumno_id"], curso_id=s["curso_id"], monto=s["monto"]), key, timeout)
-        if result.get("estado") == "RECHAZADO":
+        """COBRADO: cobro inmediato. PENDIENTE: el comprador debe pagar en Webpay (devuelve redirect_url)."""
+        result = http("POST", pay+"/v1/payments", dict(alumno_id=s["alumno_id"], curso_id=s["curso_id"], monto=s["monto"]),
+                      key, timeout, api_key=pay_key())
+        estado = result.get("estado")
+        if estado in ("RECHAZADO", "ABORTADO", "EXPIRADO", "CANCELADO"):
             raise BusinessError()
-        if result.get("estado") != "COBRADO":
-            raise DependencyFailure()
+        if estado == "COBRADO":
+            return {"estado": "COBRADO"}
+        if estado == "PENDIENTE" and result.get("redirect_url"):
+            return {k: result.get(k) for k in ("estado", "payment_id", "redirect_url", "expira_at")}
+        raise DependencyFailure()
 
     def refund(s, key, original, timeout):
-        result = http("POST", pay+"/v1/payments/refund", dict(original_key=original), key, timeout)
-        if result.get("estado") not in ("REEMBOLSADO", "INEXISTENTE"):
+        result = http("POST", pay+"/v1/payments/refund", dict(original_key=original), key, timeout, api_key=pay_key())
+        # CANCELADO: el cobro seguía abierto y se canceló (no habrá cobro tardío).
+        if result.get("estado") not in ("REEMBOLSADO", "INEXISTENTE", "CANCELADO"):
             raise DependencyFailure()
+
+    def payment_status(s, key, timeout):
+        return http("GET", pay+"/v1/payments/by-key/"+urllib.parse.quote(key, safe=""), None, key, timeout, api_key=pay_key())
 
     options = dict(timeout=float(os.getenv("SAGA_TIMEOUT_SECONDS", "2")),
                    capacity=int(os.getenv("SAGA_BULKHEAD", "8")),
                    threshold=int(os.getenv("SAGA_CB_THRESHOLD", "5")),
                    recovery=float(os.getenv("SAGA_CB_RECOVERY_SECONDS", "15")))
-    return {"RESERVAR": Client(reserve, release, **options), "COBRAR": Client(charge, refund, **options),
+    return {"RESERVAR": Client(reserve, release, **options), "COBRAR": Client(charge, refund, inquiry=payment_status, **options),
             "INSCRIBIR": Client(enroll, cancel, **options)}

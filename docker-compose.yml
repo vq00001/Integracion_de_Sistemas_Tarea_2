@@ -115,6 +115,11 @@ services:
       INTERNAL_KEY: ${INTERNAL_KEY:?Falta INTERNAL_KEY}
       INSCRIPCION_URL: http://matriculas-api:8000
       PAGOS_URL: ${PAGOS_URL:-http://pagos:8000}
+      # Credencial PROPIA de Pagos (antes se enviaba la clave admin de Inscripción) y clave de sus avisos.
+      PAGOS_API_KEY: ${PAGOS_API_KEY:?Ejecuta python scripts/generar_env.py}
+      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:?Ejecuta python scripts/generar_env.py}
+      SAGA_PAGO_POLL_SECONDS: ${SAGA_PAGO_POLL_SECONDS:-15}
+      SAGA_PAGO_GRACIA_SECONDS: ${SAGA_PAGO_GRACIA_SECONDS:-60}
       CUPOS_GRPC_TARGET: cupos:50051
       SAGA_STALE_SECONDS: ${SAGA_STALE_SECONDS:-60}
       SAGA_RECONCILE_SECONDS: ${SAGA_RECONCILE_SECONDS:-10}
@@ -131,6 +136,41 @@ services:
         condition: service_healthy
       matriculas-api:
         condition: service_healthy
+      pagos:
+        condition: service_healthy
+
+  # Pagos: cobro con Transbank Webpay Plus (ambiente de integración gratuito por defecto).
+  # Base propia (SQLite en pagos_data). Solo el gateway expone sus dos rutas de comprador.
+  pagos:
+    build:
+      context: .
+      dockerfile: pagos/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite:////data/pagos.db
+      PAGOS_API_KEY: ${PAGOS_API_KEY:?Ejecuta python scripts/generar_env.py}
+      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:?Ejecuta python scripts/generar_env.py}
+      INTERNAL_KEY: ${INTERNAL_KEY:?Ejecuta python scripts/generar_env.py}
+      ORQUESTADOR_URL: http://orquestador:8000
+      PAGOS_PUBLIC_BASE_URL: ${PAGOS_PUBLIC_BASE_URL:-http://localhost:8000}
+      TBK_BASE_URL: ${TBK_BASE_URL:-https://webpay3gint.transbank.cl}
+      TBK_COMMERCE_CODE: ${TBK_COMMERCE_CODE:-597055555532}
+      TBK_API_KEY: ${TBK_API_KEY:-579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C}
+      TBK_TIMEOUT_SECONDS: ${TBK_TIMEOUT_SECONDS:-1.5}
+      PAGOS_TTL_SECONDS: ${PAGOS_TTL_SECONDS:-600}
+      PAGOS_CB_THRESHOLD: ${PAGOS_CB_THRESHOLD:-5}
+      PAGOS_CB_RECOVERY_SECONDS: ${PAGOS_CB_RECOVERY_SECONDS:-15}
+      PAGOS_BULKHEAD: ${PAGOS_BULKHEAD:-8}
+    volumes:
+      - pagos_data:/data            # BD propia del servicio
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   # Backend for frontend: compone cursos + matrículas para el portal web.
   bff:
@@ -165,6 +205,7 @@ services:
     environment:
       INSCRIPCION_SERVICE_URL: http://matriculas-api:8000
       ORCHESTRATOR_SERVICE_URL: http://orquestador:8000
+      PAGOS_SERVICE_URL: http://pagos:8000   # solo las rutas públicas del comprador (retorno de Webpay)
       BFF_SERVICE_URL: http://bff:8090
       MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
       MATRICULAS_JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
@@ -181,6 +222,8 @@ services:
         condition: service_healthy
       orquestador:
         condition: service_started
+      pagos:
+        condition: service_healthy
       bff:
         condition: service_healthy
 
@@ -236,5 +279,6 @@ services:
 
 volumes:
   sagas_data:
+  pagos_data:
   cupos_data:
   matriculas_db_data:

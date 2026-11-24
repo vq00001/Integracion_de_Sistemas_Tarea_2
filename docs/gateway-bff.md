@@ -13,6 +13,8 @@
 | `GET /v1/bff/dashboard` | BFF web | Agrega cursos disponibles y matrículas del usuario. |
 | `POST /v1/matriculas` | Orquestador | Ejecuta Saga; el gateway agrega la API key interna del orquestador. |
 | `GET /v1/sagas/{id}` | Orquestador | Consulta el estado de una Saga. |
+| `GET /v1/pagos/ir/{id}` | Pagos | **Pública** (sin credencial): el comprador abre `pago_url` y se le redirige a Webpay. Rate limit por IP. |
+| `GET`/`POST /v1/pagos/retorno` | Pagos | **Pública**: Webpay devuelve aquí al comprador con `token_ws`. Pagos confirma con Transbank; el contenido de la petición nunca se da por cierto. Rate limit por IP. |
 | `GET /health` | Gateway | Salud del gateway. |
 
 El BFF llama en paralelo al RPC `listarCursosDisponibles` de Cupos por gRPC y a
@@ -63,8 +65,9 @@ Los valores configurables están en `.env.example`:
 - `ORCHESTRATOR_API_KEY` (credencial interna inyectada al enrutar la Saga).
 - `GATEWAY_RATE_LIMIT`, `GATEWAY_RATE_WINDOW_SECONDS`, `GATEWAY_PROXY_TIMEOUT_SECONDS`, `API_BIND`.
 - `BFF_UPSTREAM_TIMEOUT_SECONDS`, `BFF_MAX_WORKERS`.
-- `PAGOS_URL`, `SAGA_TIMEOUT_SECONDS`, `SAGA_BULKHEAD`, `SAGA_CB_THRESHOLD`,
+- `PAGOS_URL`, `SAGA_PAGO_POLL_SECONDS`, `SAGA_TIMEOUT_SECONDS`, `SAGA_BULKHEAD`, `SAGA_CB_THRESHOLD`,
   `SAGA_CB_RECOVERY_SECONDS`, `SAGA_RETRIES`, `SAGA_BACKOFF_SECONDS` y valores de reconciliación.
 
-El servicio Pagos no está implementado en este repositorio. La Saga espera que `PAGOS_URL` apunte a
-un servicio compatible con los endpoints de cobro y reembolso documentados en [`saga.md`](saga.md).
+El servicio Pagos está en [`../pagos/`](../pagos/README.md) (Transbank Webpay Plus). El gateway solo enruta hacia él las dos rutas
+públicas del comprador; su API de servicio (`/v1/payments…`) y `/internal` nunca se exponen. Variables: `PAGOS_SERVICE_URL`
+(gateway), `PAGOS_API_KEY`, `PAGOS_CALLBACK_KEY`, `PAGOS_PUBLIC_BASE_URL`, `TBK_*` y `PAGOS_TTL_SECONDS`; contrato en [`saga.md`](saga.md).

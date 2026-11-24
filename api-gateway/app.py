@@ -23,6 +23,7 @@ ORQUESTADOR_URL = os.getenv(
     "ORCHESTRATOR_SERVICE_URL", "http://orquestador:8000"
 ).rstrip("/")
 BFF_URL = os.getenv("BFF_SERVICE_URL", "http://bff:8090").rstrip("/")
+PAGOS_URL = os.getenv("PAGOS_SERVICE_URL", "http://pagos:8000").rstrip("/")
 JWT_SECRET = os.getenv("MATRICULAS_JWT_SECRET", "")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "matriculas-api-local")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "matriculas-api")
@@ -68,6 +69,14 @@ def _jwt_subject(token: str) -> str | None:
         return subject if isinstance(subject, str) and subject else None
     except (ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+def _es_ruta_publica_de_pagos() -> bool:
+    """Solo las dos rutas del comprador: Webpay lo devuelve al navegador sin credenciales nuestras.
+    La API de servicio de Pagos (/v1/payments…) nunca pasa por el gateway."""
+    if request.path == "/v1/pagos/retorno":
+        return request.method in ("GET", "POST")
+    return request.method == "GET" and request.path.startswith("/v1/pagos/ir/") and request.path.count("/") == 4
 
 
 def _principal() -> tuple[str | None, str | None]:
@@ -167,6 +176,9 @@ def authenticate_and_limit():
     # La emisión OAuth2 requiere acceso anónimo; el rate limit por IP también la protege.
     if request.path == "/v1/auth/token" and request.method == "POST":
         identity = f"auth-ip:{request.remote_addr or 'unknown'}"
+    elif _es_ruta_publica_de_pagos():
+        # Sin autenticación (el comprador viene de Webpay); la autoridad es Transbank, no el navegador.
+        identity = f"pagos-ip:{request.remote_addr or 'unknown'}"
     else:
         identity, error = _principal()
         if error:
@@ -192,6 +204,12 @@ def bff_proxy(path: str):
 )
 def bff_root(path: str):
     return _proxy(BFF_URL)
+
+
+@app.route("/v1/pagos/retorno", methods=["GET", "POST"])
+@app.route("/v1/pagos/ir/<payment_id>", methods=["GET"])
+def pagos_comprador(payment_id: str = ""):
+    return _proxy(PAGOS_URL)
 
 
 @app.route("/v1/matriculas", methods=["POST"])

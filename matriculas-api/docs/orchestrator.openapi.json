@@ -327,7 +327,7 @@
           },
           "estado": {
             "type": "string",
-            "pattern": "^(EN_CURSO|COMPLETADA|COMPENSANDO|COMPENSADA|COMPENSACION_PENDIENTE)$",
+            "pattern": "^(EN_CURSO|ESPERANDO_PAGO|COMPLETADA|COMPENSANDO|COMPENSADA|COMPENSACION_PENDIENTE)$",
             "title": "Estado"
           },
           "motivo_fallo": {
@@ -340,6 +340,30 @@
               }
             ],
             "title": "Motivo Fallo"
+          },
+          "pago_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pago Url",
+            "description": "En ESPERANDO_PAGO: abrir en el navegador del comprador para pagar con Webpay"
+          },
+          "pago_expira_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pago Expira At",
+            "description": "Vencimiento del pago (UTC); pasado ese plazo la matrícula se compensa"
           }
         },
         "type": "object",

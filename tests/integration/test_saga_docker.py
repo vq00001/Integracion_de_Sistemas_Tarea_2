@@ -1,5 +1,8 @@
-"""Prueba destructiva de proceso, opt-in: requiere Pagos compatible y Docker accesible."""
+"""Prueba destructiva de proceso, opt-in: requiere Docker accesible y Pagos apuntando al simulador de
+Transbank (TBK_BASE_URL → tests/support/fake_transbank.py): el cobro con Webpay exige un comprador, que
+esta prueba reemplaza pagando en el formulario del simulador. Con Webpay real se omite."""
 import os
+import re
 import threading
 import time
 import uuid
@@ -9,6 +12,18 @@ import requests
 from tests.conftest import compose
 
 pytestmark=pytest.mark.falla
+
+
+def pagar_en_simulador(pago_url):
+    """Hace de comprador: abre la redirección, aprueba en el formulario del simulador y vuelve a Pagos."""
+    html=requests.get(pago_url,timeout=10).text
+    action=re.search(r"action='([^']+)'",html)
+    token=re.search(r"name='token_ws' value='(\w+)'",html)
+    if not (action and token) or 'transbank.cl' in action.group(1):
+        pytest.skip('El cobro usa Webpay real: apuntar TBK_BASE_URL al simulador (tests/support/fake_transbank.py)')
+    base=action.group(1).rsplit('/webpayserver/',1)[0]
+    result=requests.post(base+'/fake/resolver',data={'token':token.group(1),'resultado':'aprobar'},timeout=15)
+    assert result.status_code==200 and 'Pago aprobado' in result.text
 
 
 def test_docker_kill_recupera_saga_en_medio_de_inscripcion(estudiante):
@@ -46,6 +61,8 @@ def test_docker_kill_recupera_saga_en_medio_de_inscripcion(estudiante):
             if replay.status_code==202:
                 saga=replay.json(); break
         assert saga is not None, 'No se observó una saga en curso'
+        if saga.get('estado')=='ESPERANDO_PAGO':
+            pagar_en_simulador(saga['pago_url'])  # la saga se reanuda e inscribe (lento por la falla inducida)
         # Esperar intención INSCRIBIR en logs, sin asumir cuánto tarda Pagos.
         while time.monotonic()<deadline:
             logs=compose('logs','--no-log-prefix','orquestador').stdout

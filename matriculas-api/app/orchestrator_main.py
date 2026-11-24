@@ -4,7 +4,7 @@ import secrets
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, func, select
@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from .database import Base
 from .errors import register_exception_handlers
-from .saga import Orchestrator, Saga, SagaStep, snapshot
+from .saga import Orchestrator, Saga, SagaStep, snapshot, verificar_esquema
 from .saga_clients import clients_from_env
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -22,7 +22,9 @@ engine = create_engine(os.getenv("SAGA_DATABASE_URL", "sqlite:///./sagas.db"),
 sessions = sessionmaker(engine)
 orchestrator = Orchestrator(sessions, clients_from_env(),
     retries=int(os.getenv("SAGA_RETRIES", "3")), backoff=float(os.getenv("SAGA_BACKOFF_SECONDS", "0.1")),
-    stale_seconds=float(os.getenv("SAGA_STALE_SECONDS", "60")))
+    stale_seconds=float(os.getenv("SAGA_STALE_SECONDS", "60")),
+    poll_seconds=float(os.getenv("SAGA_PAGO_POLL_SECONDS", "15")),
+    pago_gracia=float(os.getenv("SAGA_PAGO_GRACIA_SECONDS", "60")))
 
 
 def auth(x_api_key: str = Header(default="")):
@@ -35,6 +37,7 @@ def auth(x_api_key: str = Header(default="")):
 async def lifespan(app):
     if len(os.getenv("ORCHESTRATOR_API_KEY", "")) < 24:
         raise RuntimeError("ORCHESTRATOR_API_KEY debe tener al menos 24 caracteres")
+    verificar_esquema(engine)
     # Solo tablas del orquestador en su base propia.
     Base.metadata.create_all(engine, tables=[Saga.__table__, SagaStep.__table__])
     stop = threading.Event()
@@ -65,8 +68,10 @@ class Matricular(BaseModel):
 
 class SagaOut(Matricular):
     id: str
-    estado: str = Field(pattern="^(EN_CURSO|COMPLETADA|COMPENSANDO|COMPENSADA|COMPENSACION_PENDIENTE)$")
+    estado: str = Field(pattern="^(EN_CURSO|ESPERANDO_PAGO|COMPLETADA|COMPENSANDO|COMPENSADA|COMPENSACION_PENDIENTE)$")
     motivo_fallo: str | None
+    pago_url: str | None = Field(default=None, description="En ESPERANDO_PAGO: abrir en el navegador del comprador para pagar con Webpay")
+    pago_expira_at: str | None = Field(default=None, description="Vencimiento del pago (UTC); pasado ese plazo la matrícula se compensa")
 
 
 from .schemas import ErrorResponse
@@ -83,7 +88,7 @@ def matricular(payload: Matricular, response: Response,
     result, replay = orchestrator.matricular(idempotency_key, **payload.model_dump())
     state = result["estado"]
     response.status_code = (200 if replay else 201) if state == "COMPLETADA" else 202 if state in (
-        "EN_CURSO", "COMPENSANDO", "COMPENSACION_PENDIENTE") else 503
+        "EN_CURSO", "ESPERANDO_PAGO", "COMPENSANDO", "COMPENSACION_PENDIENTE") else 503
     if replay:
         response.headers["Idempotent-Replayed"] = "true"
     return result
@@ -96,6 +101,31 @@ def consultar(saga_id: str):
         if saga is None:
             raise HTTPException(404, "Saga inexistente")
         return snapshot(saga)
+
+
+def callback_auth(x_callback_key: str = Header(default="")):
+    expected = os.getenv("PAGOS_CALLBACK_KEY", "")
+    if len(expected) < 24 or not secrets.compare_digest(expected, x_callback_key):
+        raise HTTPException(401, "Clave de aviso requerida")
+
+
+class PagoResultado(BaseModel):
+    payment_key: str = Field(min_length=1, max_length=128)
+    estado: str = Field(max_length=16)
+
+
+@app.post("/internal/pagos/resultado", status_code=202, include_in_schema=False, dependencies=[Depends(callback_auth)])
+def pago_resultado(payload: PagoResultado, tasks: BackgroundTasks):
+    """Aviso de Pagos: hay un resultado para el cobro de una saga. Es solo una pista: el orquestador
+    consulta a Pagos y actúa según su respuesta, nunca según el contenido de este mensaje."""
+    saga_id = payload.payment_key.split(":")[0]
+    with sessions() as db:
+        saga = db.get(Saga, saga_id)
+        if saga is None:
+            raise HTTPException(404, "Saga inexistente")
+        estado = saga.estado
+    tasks.add_task(orchestrator.sondear_pago, saga_id)
+    return {"saga_id": saga_id, "estado": estado}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)

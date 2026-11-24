@@ -32,6 +32,8 @@ def main() -> int:
             "ORCHESTRATOR_API_KEY": secrets.token_urlsafe(32),
             "INTERNAL_KEY": secrets.token_urlsafe(32),
             "MATRICULAS_JWT_SECRET": secrets.token_urlsafe(48),
+            "PAGOS_API_KEY": secrets.token_urlsafe(32),
+            "PAGOS_CALLBACK_KEY": secrets.token_urlsafe(32),
         }
         modificada = False
         for nombre, valor in secretos.items():
@@ -61,6 +63,8 @@ def main() -> int:
         "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),
         "MATRICULAS_JWT_SECRET": secrets.token_urlsafe(48),
         "MATRICULAS_DB_PASSWORD": secrets.token_urlsafe(24),
+        "PAGOS_API_KEY": secrets.token_urlsafe(32),
+        "PAGOS_CALLBACK_KEY": secrets.token_urlsafe(32),
     }
     lineas = []
     for linea in plantilla.read_text(encoding="utf-8").splitlines():

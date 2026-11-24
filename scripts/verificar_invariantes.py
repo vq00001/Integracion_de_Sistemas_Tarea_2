@@ -26,7 +26,7 @@ def verificar(saga,reservation,payment,enrollments):
     if saga['estado']=='COMPLETADA':
         return reserved and payment['estado']=='COBRADO' and active
     if saga['estado']=='COMPENSADA':
-        return not reserved and payment['estado'] in ('REEMBOLSADO','INEXISTENTE') and not active
+        return not reserved and payment['estado'] in ('REEMBOLSADO','INEXISTENTE','CANCELADO') and not active
     raise ValueError('La saga aún no es terminal')
 
 

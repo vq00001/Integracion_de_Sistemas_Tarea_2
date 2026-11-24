@@ -239,3 +239,55 @@ configuración, el número de repeticiones y los CSV utilizados para generarla.
   entorno Compose; no sería observable así en producción.
 - Un reloj de VM con deriva altera las latencias medidas respecto de las inyectadas; se calibra y se registra, no se corrige en los datos.
 - La caché de disponibilidad (`GET /v1/courses`) **no** se midió; el diseño la justifica (D1) pero no hay datos de cuánto reduce la carga.
+
+
+## Experimento `saga_fallas` (Unidad 3): evidencia antes y después de los tres escenarios
+
+Responde a lo que pide el encargo U3: provocar las fallas, mostrar **qué hace el sistema antes y después** y **qué habría pasado sin el patrón**.
+Los experimentos anteriores de esta carpeta miden el flujo de la Tarea 1; este mide la saga de matrícula con Pagos (Transbank Webpay Plus).
+
+| Escenario | Qué se hace | Qué se mide |
+|---|---|---|
+| **E1 Éxito** | 5 matrículas completas (el comprador paga en Webpay simulado) | Estado de Cupos, Inscripción y Pagos antes/después; pasos firmes en orden |
+| **E2 Fallo con compensación** | Falla el último paso (Inscripción) tras pagar | Reembolso, cupo liberado, sin inscripción; orden inverso de la compensación |
+| **E3 Cascada contenida** | Una carga constante atraviesa las fases `antes → lenta → alivio → bulkhead → pico → caída → recuperación` (Transbank lento, pico de carga, caído) | Latencias, estado del circuito, rechazos del bulkhead, intentos reales a Transbank, sagas por estado y **el resto del sistema** (sondas) |
+
+E3 se ejecuta dos veces con la misma carga: **con patrón** (configuración normal) y **sin patrón** (Circuit Breaker y Bulkhead inertes, con los mismos timeouts). La sonda `GET /v1/sagas/{id}` comparte proceso con la saga (ahí se ve la cascada), `GET /v1/health` de Pagos comparte proceso con la llamada lenta a Transbank (ahí se ve si el bulkhead protege sus hilos) y `GET /v1/enrollments` es otro servicio (ahí se ve el aislamiento).
+
+### Cómo ejecutarlo
+
+Corre con procesos locales (Cupos gRPC, Inscripción, Orquestador y Pagos reales; solo Transbank y el comprador simulados), sin Docker ni internet:
+
+```bash
+pip install -r matriculas-api/requirements.txt -r pagos/requirements.txt -r tests/requirements.txt
+python experiment/scripts/saga_fallas.py --repeticiones 3     # completo: ≈ 15 min (E1/E2 + 3 × (con y sin patrón))
+python experiment/scripts/saga_fallas.py --rapido             # fases cortas para probar el script (≈ 4 min)
+python experiment/scripts/saga_fallas.py --solo-base          # solo E1 y E2
+```
+
+Para correrlo por partes con el mismo `--ts` (los CSV se fusionan): `--solo-cascada --variantes con_patron --desde-rep 2 --repeticiones 1 --ts <ts>`.
+
+### Qué produce
+
+- `data/raw/saga_fallas_<ts>_*.csv`: peticiones, sondas, métricas muestreadas cada 0,5 s, fases, estados antes/después por fase y escenarios E1/E2.
+- `results/saga_fallas_cascada_<ts>.png`: línea de tiempo con y sin patrón (latencia, resto del sistema, circuitos y bulkhead, sagas por estado).
+- `results/saga_fallas_fases_<ts>.png|csv|md`: comparación por fase (medianas y rango entre repeticiones).
+- `results/saga_fallas_antes_despues_<ts>.png`: estado de los tres servicios antes/después en E1 y E2.
+- `results/resumen_saga_fallas_<ts>.md`: lectura de la evidencia **con los números de la corrida** y los hallazgos que se detectan en los datos.
+
+Ejecución de referencia incluida en el repositorio: `20261121_completo` (3 repeticiones por variante).
+
+### Cómo se lee frente a la rúbrica
+
+- *Escenarios claros y reproducibles*: el script y los parámetros (`plan()` y `PATRONES`) son la definición; `tests/unit/test_saga_fallas_experimento.py` verifica sus piezas deterministas.
+- *Evidencia antes/después*: figuras y CSV anteriores, con el estado leído directamente de la base de cada servicio.
+- *Interpretación y qué habría pasado sin el patrón*: la comparación con/sin patrón del resumen y sus **límites** (una máquina, SQLite, Transbank simulado).
+
+### Límites
+
+Transbank está simulado y la latencia/caída se inducen en Pagos (`PUT /internal/fault`); todo corre en una máquina con SQLite y un proceso por servicio; las matrículas de E3 quedan en `ESPERANDO_PAGO` (miden reserva y cobro pendiente, no la inscripción); las cifras absolutas dependen del equipo, lo que importa es la comparación entre variantes.
+
+### Evidencia complementaria: integridad y bulkhead con dependencias sanas
+
+`python experiment/scripts/saga_integridad_bulkhead.py` (segundos, sin servicios externos) reproduce dos hallazgos abiertos de la saga y deja CSV y resumen en `data/raw/` y `results/`:
+(A) `POST /v1/enrollments` inscribe sin pasar por la saga (sin cupo ni pago, incluso en un curso inexistente) y (B) con dependencias **sanas**, el bulkhead del orquestador (capacidad 8) compensa matrículas legítimas desde las 12 simultáneas.

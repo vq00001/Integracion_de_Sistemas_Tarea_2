@@ -1,0 +1,8 @@
+experimento,caso,codigo,estado,esperado,simultaneas,capacidad_bulkhead,COMPLETADA,COMPENSADA,COMPENSACION_PENDIENTE,pct_completadas,rechazos_bulkhead,segundos
+A_bypass_saga,POST /v1/enrollments curso 5 (curso con 2 cupos),201,CONFIRMADA,rechazo (la regla exige cupo y pago),,,,,,,,
+A_bypass_saga,POST /v1/enrollments curso 999 (curso INEXISTENTE),201,CONFIRMADA,rechazo (la regla exige cupo y pago),,,,,,,,
+B_bulkhead_dependencias_sanas,,,,,4,8,4,0,0,100.0,0,0.98
+B_bulkhead_dependencias_sanas,,,,,8,8,8,0,0,100.0,0,1.02
+B_bulkhead_dependencias_sanas,,,,,12,8,8,0,4,66.7,16,1.01
+B_bulkhead_dependencias_sanas,,,,,24,8,14,6,4,58.3,31,1.42
+B_bulkhead_dependencias_sanas,,,,,48,8,38,5,5,79.2,29,3.09

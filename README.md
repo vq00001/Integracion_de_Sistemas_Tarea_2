@@ -25,6 +25,7 @@ La integración se implementa en `matriculas-api/`, una API REST desarrollada co
 ├── docs/adr/                                       # ADR D1–D4 + D5 (autenticación, transporte, privacidad)
 ├── experiment/                                     # scripts, datos crudos (data/raw) y figuras de los experimentos
 ├── tests/                                          # grpc/, integration/, contract/ y unit/ (unitarias en proceso, sin Docker)
+├── pagos/                                          # servicio Pagos: cobro con Transbank Webpay Plus (FastAPI + SQLite); ver pagos/README.md
 ├── cupos/                                          # servicio Cupos (Python + gRPC + SQLite)
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -96,7 +97,7 @@ python scripts/generar_env.py
 docker compose up --build -d
 ```
 
-El primer comando genera `.env` con claves aleatorias sin sobrescribir un archivo existente. El segundo inicia Cupos, PostgreSQL, `matriculas-api`, el orquestador de Saga, el BFF y el gateway. Solo el gateway publica el puerto `8000`; los servicios de dominio quedan dentro de la red de Compose.
+El primer comando genera `.env` con claves aleatorias sin sobrescribir un archivo existente. El segundo inicia Cupos, PostgreSQL, `matriculas-api`, **Pagos (Transbank Webpay Plus, ambiente de integración gratuito)**, el orquestador de Saga, el BFF y el gateway. Solo el gateway publica el puerto `8000`; los servicios de dominio quedan dentro de la red de Compose.
 
 El gateway está disponible en `http://localhost:8000`. `GET /v1/bff/dashboard` devuelve cursos disponibles e inscripciones en una respuesta. La operación Saga se expone en `POST /v1/matriculas` y su consulta en `GET /v1/sagas/{id}`. Las rutas y ejemplos de autenticación están descritos en [`docs/gateway-bff.md`](docs/gateway-bff.md) y [`matriculas-api/README.md`](matriculas-api/README.md).
 
@@ -113,6 +114,10 @@ Para iniciar únicamente Cupos:
 ```bash
 docker compose up --build cupos
 ```
+
+### Probar el pago con Transbank
+
+`POST /v1/matriculas` reserva el cupo y devuelve `202 ESPERANDO_PAGO` con una `pago_url`. Ábrela en el navegador, paga con la tarjeta de pruebas de Transbank y la matrícula se completa sola; la guía paso a paso (tarjetas, fallas inducidas y simulador sin internet) está en [`pagos/README.md`](pagos/README.md). El diseño y el contrato están en [`docs/saga.md`](docs/saga.md) (ADR-8).
 
 ### Ejecutar el CLI legado
 
@@ -256,6 +261,10 @@ Los ejecutores de pruebas de fallas y experimentos requieren acceso al socket Do
 El proyecto Compose utiliza el nombre fijo `integracion-sistemas-t1`, de modo que todos los ejecutores administran los mismos servicios. Si existen contenedores levantados con una configuración anterior, deben detenerse antes de iniciar la actual para evitar conflictos en el puerto `8000`.
 
 El repositorio se monta en `/repo` en los ejecutores, lo que permite reflejar cambios de código y guardar resultados en el directorio local.
+
+### Experimento de la saga con Pagos (Unidad 3)
+
+`experiment/scripts/saga_fallas.py` ejecuta los tres escenarios del encargo (éxito, falla del último paso, cascada contenida con Transbank lento, pico y caída) y genera la evidencia antes/después y la comparación **con y sin Circuit Breaker/Bulkhead** (CSV, figuras y resumen interpretado). Ver [`experiment/README.md`](experiment/README.md#experimento-saga_fallas-unidad-3-evidencia-antes-y-después-de-los-tres-escenarios).
 
 ## Historial de versiones de los contratos
 

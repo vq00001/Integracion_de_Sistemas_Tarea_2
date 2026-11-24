@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, select, text
@@ -17,7 +17,7 @@ from .errors import ConflictError, IdempotencyKeyReusedError
 from .time import utc_now
 
 log = logging.getLogger("saga")
-ACTIVE = "estado IN ('EN_CURSO','COMPENSANDO','COMPENSACION_PENDIENTE','COMPLETADA')"
+ACTIVE = "estado IN ('EN_CURSO','ESPERANDO_PAGO','COMPENSANDO','COMPENSACION_PENDIENTE','COMPLETADA')"
 STEPS = ("RESERVAR", "COBRAR", "INSCRIBIR")
 
 
@@ -26,7 +26,7 @@ class Saga(Base):
     __table_args__ = (
         Index("uq_saga_activa", "alumno_id", "curso_id", unique=True,
               sqlite_where=text(ACTIVE), postgresql_where=text(ACTIVE)),
-        CheckConstraint("estado IN ('EN_CURSO','COMPLETADA','COMPENSANDO','COMPENSADA','COMPENSACION_PENDIENTE')"),
+        CheckConstraint("estado IN ('EN_CURSO','ESPERANDO_PAGO','COMPLETADA','COMPENSANDO','COMPENSADA','COMPENSACION_PENDIENTE')"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
@@ -36,6 +36,9 @@ class Saga(Base):
     monto: Mapped[int] = mapped_column(Integer)
     estado: Mapped[str] = mapped_column(String(32), default="EN_CURSO")
     motivo_fallo: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Cobro con redirección (Webpay Plus): dónde debe pagar el comprador y hasta cuándo se espera.
+    pago_url: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    pago_expira_at: Mapped[object | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
     updated_at: Mapped[object] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -58,7 +61,29 @@ class SagaStep(Base):
 
 
 def snapshot(s):
-    return {k: getattr(s, k) for k in ("id", "alumno_id", "curso_id", "monto", "estado", "motivo_fallo")}
+    data = {k: getattr(s, k) for k in ("id", "alumno_id", "curso_id", "monto", "estado", "motivo_fallo")}
+    data["pago_url"] = s.pago_url
+    data["pago_expira_at"] = s.pago_expira_at.isoformat() + "Z" if s.pago_expira_at else None
+    return data
+
+
+def verificar_esquema(engine):
+    """Falla con un mensaje claro si la base de sagas es anterior al cobro con Webpay (SQLite no
+    permite alterar un CHECK: sin esto el primer pago fallaría con un error confuso)."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as conn:
+        ddl = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='sagas'")).scalar()
+    if ddl and "ESPERANDO_PAGO" not in ddl:
+        raise RuntimeError("La base de sagas tiene el esquema anterior al cobro con Webpay (falta ESPERANDO_PAGO). "
+                           "Borra el volumen sagas_data (docker compose down -v) o el archivo sagas.db.")
+
+
+def _parse_utc(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "")) if value else None
+    except ValueError:
+        return None
 
 
 @contextmanager
@@ -90,9 +115,12 @@ def saga_lock(engine, sid):
 
 
 class Orchestrator:
-    def __init__(self, sessions, clients, retries=3, backoff=0.1, stale_seconds=60):
+    def __init__(self, sessions, clients, retries=3, backoff=0.1, stale_seconds=60,
+                 poll_seconds=15, pago_gracia=60, pago_max_seconds=900):
         self.sessions, self.clients = sessions, clients
         self.retries, self.backoff, self.stale_seconds = retries, backoff, stale_seconds
+        # Espera de pago: cada cuánto se consulta a Pagos, gracia tras el vencimiento y tope si Pagos no informa vencimiento.
+        self.poll_seconds, self.pago_gracia, self.pago_max_seconds = poll_seconds, pago_gracia, pago_max_seconds
 
     def transition(self, db, saga, state, step=None, duration=0):
         if step is None:
@@ -138,23 +166,98 @@ class Orchestrator:
                     self.transition(db, saga, "COMPENSANDO")
                     self.transition(db, saga, "COMPENSADA")
                     return snapshot(saga), False
-                for step in STEPS:
-                    row = self.intent(db, saga, step, "forward")
-                    start = time.monotonic()
-                    try:
-                        self.clients[step].forward(snapshot(saga), row.clave)
-                    except Exception as exc:
-                        # No se guardan cuerpos ni mensajes de terceros (pueden contener PII).
-                        row.estado = "FALLIDO" if getattr(exc, "business", False) else "INCIERTO"
-                        row.error = type(exc).__name__
-                        saga.motivo_fallo = f"{step}:{row.error}"
-                        self.transition(db, saga, row.estado, step, time.monotonic()-start)
-                        self.compensar(db, saga)
-                        return snapshot(saga), False
+                return self._avanzar(db, saga, 0), False
+
+    def _avanzar(self, db, saga, desde):
+        """Ejecuta los pasos hacia adelante desde STEPS[desde]. Si el cobro requiere que el comprador
+        pague en Webpay (Pagos responde PENDIENTE), la saga queda ESPERANDO_PAGO y se reanuda con
+        pago_resuelto()."""
+        for step in STEPS[desde:]:
+            row = self.intent(db, saga, step, "forward")
+            start = time.monotonic()
+            try:
+                result = self.clients[step].forward(snapshot(saga), row.clave)
+            except Exception as exc:
+                # No se guardan cuerpos ni mensajes de terceros (pueden contener PII).
+                row.estado = "FALLIDO" if getattr(exc, "business", False) else "INCIERTO"
+                row.error = type(exc).__name__
+                saga.motivo_fallo = f"{step}:{row.error}"
+                self.transition(db, saga, row.estado, step, time.monotonic()-start)
+                self.compensar(db, saga)
+                return snapshot(saga)
+            if step == "COBRAR" and isinstance(result, dict) and result.get("estado") == "PENDIENTE":
+                # El paso queda PENDIENTE: hay un cobro abierto en Pagos que, si hace falta, se cancela.
+                saga.pago_url = (result.get("redirect_url") or "")[:256] or None
+                saga.pago_expira_at = (_parse_utc(result.get("expira_at"))
+                                       or utc_now() + timedelta(seconds=self.pago_max_seconds))
+                self.transition(db, saga, "ESPERANDO_PAGO")
+                return snapshot(saga)
+            row.estado = "OK"
+            self.transition(db, saga, "OK", step, time.monotonic()-start)
+        self.transition(db, saga, "COMPLETADA")
+        return snapshot(saga)
+
+    def pago_resuelto(self, saga_id, estado_pago):
+        """Reanuda una saga ESPERANDO_PAGO con el resultado informado por Pagos (idempotente)."""
+        with self.sessions() as db:
+            saga = db.get(Saga, saga_id)
+            if saga is None:
+                return None
+            with saga_lock(db.get_bind(), saga_id) as acquired:
+                if not acquired:
+                    return snapshot(saga)
+                saga = db.get(Saga, saga_id, populate_existing=True)
+                if saga.estado != "ESPERANDO_PAGO":
+                    return snapshot(saga)
+                row = db.execute(select(SagaStep).where(SagaStep.saga_id == saga.id,
+                                 SagaStep.paso == "COBRAR", SagaStep.tipo == "forward")).scalar_one()
+                if estado_pago == "COBRADO":
                     row.estado = "OK"
-                    self.transition(db, saga, "OK", step, time.monotonic()-start)
-                self.transition(db, saga, "COMPLETADA")
-                return snapshot(saga), False
+                    self.transition(db, saga, "OK", "COBRAR")
+                    self.transition(db, saga, "EN_CURSO")
+                    return self._avanzar(db, saga, STEPS.index("COBRAR") + 1)
+                # RECHAZADO / ABORTADO / EXPIRADO: Pagos garantiza que no habrá cobro, no hay nada que reembolsar.
+                row.estado, row.error = "FALLIDO", estado_pago
+                saga.motivo_fallo = f"COBRAR:{estado_pago}"
+                self.transition(db, saga, "FALLIDO", "COBRAR")
+                self.compensar(db, saga)
+                return snapshot(saga)
+
+    def sondear_pago(self, saga_id):
+        """Pregunta a Pagos por el cobro (fuente de verdad) y reanuda o expira la espera. Lo usa tanto el
+        aviso de Pagos (solo una pista) como el reconciliador, de modo que un aviso perdido no bloquea."""
+        with self.sessions() as db:
+            saga = db.get(Saga, saga_id)
+            if saga is None or saga.estado != "ESPERANDO_PAGO":
+                return None if saga is None else snapshot(saga)
+            snap = snapshot(saga)
+            limite = saga.pago_expira_at + timedelta(seconds=self.pago_gracia)
+        try:
+            estado = (self.clients["COBRAR"].query(snap, f"{saga_id}:COBRAR") or {}).get("estado")
+        except Exception:
+            estado = None  # Pagos no responde: se reintenta en el próximo ciclo
+        if estado in ("COBRADO", "RECHAZADO", "ABORTADO", "EXPIRADO"):
+            return self.pago_resuelto(saga_id, estado)
+        with self.sessions() as db:
+            saga = db.get(Saga, saga_id)
+            with saga_lock(db.get_bind(), saga_id) as acquired:
+                if not acquired:
+                    return snapshot(saga)
+                saga = db.get(Saga, saga_id, populate_existing=True)
+                if saga.estado != "ESPERANDO_PAGO":
+                    return snapshot(saga)
+                if utc_now() > limite:
+                    # Pagos no cierra el cobro: se trata como incierto para pedir su cancelación/reembolso.
+                    row = db.execute(select(SagaStep).where(SagaStep.saga_id == saga.id,
+                                     SagaStep.paso == "COBRAR", SagaStep.tipo == "forward")).scalar_one()
+                    row.estado, row.error = "INCIERTO", "PAGO_SIN_RESPUESTA"
+                    saga.motivo_fallo = "COBRAR:PAGO_SIN_RESPUESTA"
+                    self.transition(db, saga, "INCIERTO", "COBRAR")
+                    self.compensar(db, saga)
+                else:
+                    saga.updated_at = utc_now()  # espacia el siguiente sondeo
+                    db.commit()
+                return snapshot(saga)
 
     def compensar(self, db, saga):
         self.transition(db, saga, "COMPENSANDO")
@@ -198,4 +301,10 @@ class Orchestrator:
                         saga = db.get(Saga, sid, populate_existing=True)
                         if saga.estado not in ("COMPLETADA", "COMPENSADA"):
                             self.compensar(db, saga)
-        return len(ids)
+            # Sagas esperando que el comprador pague: no se compensan por inactividad (puede estar pagando);
+            # se consulta a Pagos, que decide el vencimiento.
+            esperando = db.scalars(select(Saga.id).where(Saga.estado == "ESPERANDO_PAGO",
+                Saga.updated_at < utc_now()-timedelta(seconds=self.poll_seconds)).limit(50)).all()
+        for sid in esperando:
+            self.sondear_pago(sid)
+        return len(ids) + len(esperando)
