@@ -3,10 +3,6 @@
 # porque las pruebas de falla y los experimentos apagan/reinician contenedores.
 FROM python:3.12-slim
 
-# CLI de Docker y plugin compose copiados de la imagen oficial (sin instalar nada con apt)
-COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=docker:27-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
-
 WORKDIR /repo
 COPY runner/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
@@ -18,3 +14,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     INSCRIPCION_TEST_URL=http://matriculas-api:8000 \
     BASE_URL=http://matriculas-api:8000 \
     CUPOS_GRPC_ADDR=cupos:50051
+
+# H5 exporta una copia limpia de las fuentes para probar Compose sin .env.
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+# Compose 2.33 bloqueaba --dry-run con service_completed_successfully. Usar
+# el CLI y ambos plugins de la misma imagen oficial, también para builds Bake.
+COPY --from=docker:29-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:29-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+COPY --from=docker:29-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx

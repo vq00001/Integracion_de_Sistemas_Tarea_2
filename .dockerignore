@@ -1,4 +1,7 @@
 .git
+.env
+**/.env
+*.db.*.bak
 .venv
 **/__pycache__
 **/.pytest_cache

@@ -3,6 +3,33 @@
 name: integracion-sistemas-t1
 
 services:
+  # Se ejecuta también en un clon sin .env. Nunca publica puertos ni secretos.
+  inicializar:
+    build:
+      context: .
+      dockerfile: bootstrap/Dockerfile
+    restart: "no"
+    environment:
+      MATRICULAS_DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:-}
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:-}
+      MATRICULAS_JWT_SECRET: ${MATRICULAS_JWT_SECRET:-}
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-}
+      INTERNAL_KEY: ${INTERNAL_KEY:-}
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:-}
+      PAGOS_API_KEY: ${PAGOS_API_KEY:-}
+      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:-}
+      MATRICULAS_DB_USER: ${MATRICULAS_DB_USER:-matriculas_user}
+      MATRICULAS_DB_NAME: ${MATRICULAS_DB_NAME:-matriculas_db}
+    volumes:
+      - secretos_data:/state
+      - config_db:/config/db
+      - config_api:/config/api
+      - config_orquestador:/config/orquestador
+      - config_pagos:/config/pagos
+      - config_gateway:/config/gateway
+      - config_legacy:/config/legacy
+      - config_runner:/config/runner
+
   cupos:
     build:
       context: .                    # raíz del servicio cupos
@@ -33,15 +60,19 @@ services:
     environment:
       POSTGRES_DB: ${MATRICULAS_DB_NAME:-matriculas_db}
       POSTGRES_USER: ${MATRICULAS_DB_USER:-matriculas_user}
-      POSTGRES_PASSWORD: ${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD - ejecuta `python scripts/generar_env.py`}
+      POSTGRES_PASSWORD_FILE: /run/config/password
     volumes:
+      - config_db:/run/config:ro
       - matriculas_db_data:/var/lib/postgresql/data   # BD propia del servicio (T5), igual que cupos_data
+    depends_on:
+      inicializar:
+        condition: service_completed_successfully
     expose:
       - "5432"                      # solo visible para otros servicios del compose
     # Sin `ports:`: la base contiene datos personales y no debe ser accesible desde fuera del
     # compose. Para inspeccionarla: docker compose exec matriculas-db psql -U matriculas_user -d matriculas_db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${MATRICULAS_DB_USER:-matriculas_user} -d ${MATRICULAS_DB_NAME:-matriculas_db}"]
+      test: ["CMD-SHELL", 'PGCONNECT_TIMEOUT=3 PGPASSWORD="$$(cat "$$POSTGRES_PASSWORD_FILE")" psql -X -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -Atqc "SELECT 1" >/dev/null']
       interval: 5s
       timeout: 5s
       retries: 10
@@ -54,12 +85,18 @@ services:
     stdin_open: true                # necesario: matriculas es un CLI interactivo
     tty: true
     environment:
+      SERVICE_ENV_FILE: /run/config/env.json
+      NODE_OPTIONS: --require /usr/src/app/cargar_env.cjs
       DB_HOST: matriculas-db
       DB_PORT: 5432
       DB_NAME: ${MATRICULAS_DB_NAME:-matriculas_db}
       DB_USER: ${MATRICULAS_DB_USER:-matriculas_user}
-      DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD}
+      DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:-}
+    volumes:
+      - config_legacy:/run/config:ro
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       matriculas-db:
         condition: service_healthy
     profiles: ["legacy"]            # CLI "antes de la integración" (ver README) - no se levanta por defecto
@@ -71,17 +108,16 @@ services:
       dockerfile: matriculas-api/Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql+psycopg2://${MATRICULAS_DB_USER:-matriculas_user}:${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD}@matriculas-db:5432/${MATRICULAS_DB_NAME:-matriculas_db}
+      SERVICE_ENV_FILE: /run/config/env.json
       CUPOS_GRPC_TARGET: cupos:50051
       CUPOS_GRPC_TIMEOUT_SECONDS: ${CUPOS_GRPC_TIMEOUT_SECONDS:-2.0}
       CUPOS_CB_FAILURE_THRESHOLD: ${CUPOS_CB_FAILURE_THRESHOLD:-5}
       CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
-      # SIN valor por defecto: si falta, `docker compose` se niega a levantar; y si es una clave
-      # publica/corta, la API se niega a arrancar. Genera .env con: python scripts/generar_env.py
-      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
-      INTERNAL_KEY: ${INTERNAL_KEY:?Ejecuta python scripts/generar_env.py}
-      API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
-      JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
+      # Si no hay .env, el inicializador entrega las claves por un volumen privado.
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:-}
+      INTERNAL_KEY: ${INTERNAL_KEY:-}
+      API_KEYS: ${MATRICULAS_API_KEYS:-}
+      JWT_SECRET: ${MATRICULAS_JWT_SECRET:-}
       JWT_TTL_MINUTES: ${MATRICULAS_JWT_TTL_MINUTES:-60}
       JWT_ISSUER: ${JWT_ISSUER:-matriculas-api-local}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-matriculas-api}
@@ -99,7 +135,11 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    volumes:
+      - config_api:/run/config:ro
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       matriculas-db:
         condition: service_healthy
 
@@ -110,16 +150,17 @@ services:
     command: ["uvicorn", "app.orchestrator_main:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     environment:
+      SERVICE_ENV_FILE: /run/config/env.json
       SAGA_DATABASE_URL: sqlite:////data/sagas.db
-      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?Ejecuta python scripts/generar_env.py}
-      SERVICE_API_KEY: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
-      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
-      INTERNAL_KEY: ${INTERNAL_KEY:?Falta INTERNAL_KEY}
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-}
+      SERVICE_API_KEY: ${MATRICULAS_API_KEYS:-}
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:-}
+      INTERNAL_KEY: ${INTERNAL_KEY:-}
       INSCRIPCION_URL: http://matriculas-api:8000
       PAGOS_URL: ${PAGOS_URL:-http://pagos:8000}
       # Credencial PROPIA de Pagos (antes se enviaba la clave admin de Inscripción) y clave de sus avisos.
-      PAGOS_API_KEY: ${PAGOS_API_KEY:?Ejecuta python scripts/generar_env.py}
-      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:?Ejecuta python scripts/generar_env.py}
+      PAGOS_API_KEY: ${PAGOS_API_KEY:-}
+      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:-}
       SAGA_PAGO_POLL_SECONDS: ${SAGA_PAGO_POLL_SECONDS:-15}
       SAGA_PAGO_GRACIA_SECONDS: ${SAGA_PAGO_GRACIA_SECONDS:-60}
       CUPOS_GRPC_TARGET: cupos:50051
@@ -132,8 +173,17 @@ services:
       SAGA_CB_THRESHOLD: ${SAGA_CB_THRESHOLD:-5}
       SAGA_CB_RECOVERY_SECONDS: ${SAGA_CB_RECOVERY_SECONDS:-15}
     volumes:
+      - config_orquestador:/run/config:ro
       - sagas_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       cupos:
         condition: service_healthy
       matriculas-api:
@@ -149,10 +199,11 @@ services:
       dockerfile: pagos/Dockerfile
     restart: unless-stopped
     environment:
+      SERVICE_ENV_FILE: /run/config/env.json
       DATABASE_URL: sqlite:////data/pagos.db
-      PAGOS_API_KEY: ${PAGOS_API_KEY:?Ejecuta python scripts/generar_env.py}
-      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:?Ejecuta python scripts/generar_env.py}
-      INTERNAL_KEY: ${INTERNAL_KEY:?Ejecuta python scripts/generar_env.py}
+      PAGOS_API_KEY: ${PAGOS_API_KEY:-}
+      PAGOS_CALLBACK_KEY: ${PAGOS_CALLBACK_KEY:-}
+      INTERNAL_KEY: ${INTERNAL_KEY:-}
       ORQUESTADOR_URL: http://orquestador:8000
       PAGOS_PUBLIC_BASE_URL: ${PAGOS_PUBLIC_BASE_URL:-http://localhost:8000}
       TBK_BASE_URL: ${TBK_BASE_URL:-https://webpay3gint.transbank.cl}
@@ -164,7 +215,11 @@ services:
       PAGOS_CB_RECOVERY_SECONDS: ${PAGOS_CB_RECOVERY_SECONDS:-15}
       PAGOS_BULKHEAD: ${PAGOS_BULKHEAD:-8}
     volumes:
+      - config_pagos:/run/config:ro
       - pagos_data:/data            # BD propia del servicio
+    depends_on:
+      inicializar:
+        condition: service_completed_successfully
     expose:
       - "8000"
     healthcheck:
@@ -202,28 +257,34 @@ services:
   # Único punto de entrada publicado: verifica JWT/API keys y limita por identidad.
   gateway:
     build:
-      context: ./api-gateway
+      context: .
+      dockerfile: api-gateway/Dockerfile
     restart: unless-stopped
     environment:
+      SERVICE_ENV_FILE: /run/config/env.json
       INSCRIPCION_SERVICE_URL: http://matriculas-api:8000
       ORCHESTRATOR_SERVICE_URL: http://orquestador:8000
       PAGOS_SERVICE_URL: http://pagos:8000   # solo las rutas públicas del comprador (retorno de Webpay)
       BFF_SERVICE_URL: http://bff:8090
-      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
-      MATRICULAS_JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:-}
+      MATRICULAS_JWT_SECRET: ${MATRICULAS_JWT_SECRET:-}
       JWT_ISSUER: ${JWT_ISSUER:-matriculas-api-local}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-matriculas-api}
-      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?Falta ORCHESTRATOR_API_KEY - ejecuta `python scripts/generar_env.py`}
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:-}
       GATEWAY_RATE_LIMIT: ${GATEWAY_RATE_LIMIT:-120}
       GATEWAY_RATE_WINDOW_SECONDS: ${GATEWAY_RATE_WINDOW_SECONDS:-60}
       GATEWAY_PROXY_TIMEOUT_SECONDS: ${GATEWAY_PROXY_TIMEOUT_SECONDS:-30}
     ports:
       - "${API_BIND:-127.0.0.1}:8000:8080"
+    volumes:
+      - config_gateway:/run/config:ro
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       matriculas-api:
         condition: service_healthy
       orquestador:
-        condition: service_started
+        condition: service_healthy
       pagos:
         condition: service_healthy
       bff:
@@ -240,21 +301,25 @@ services:
       context: .
       dockerfile: runner/Dockerfile
     working_dir: /repo
-    entrypoint: ["python", "scripts/ejecutar_tests.py"]
+    entrypoint: ["python", "scripts/service_env.py", "python", "scripts/ejecutar_tests.py"]
     environment:
-      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
+      SERVICE_ENV_FILE: /run/config/env.json
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:-}
       COMPOSE_ARGS: "-f docker-compose.yml"      # sin el override que publica puertos en el host
-      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:-}
       # 0 por defecto: borrar volumenes ELIMINA los datos del sistema. Solo con --reset-estado
       # (o RESET_ESTADO=1) y unicamente en una maquina donde no haya datos que conservar.
       RESET_ESTADO: ${RESET_ESTADO:-0}
     volumes:
+      - config_runner:/run/config:ro
       - .:/repo
       # ATENCION: el socket de Docker equivale a root en el anfitrion. Solo se monta en estos
       # ejecutores (profiles `tests` y `experimentos`, que nunca arrancan con `docker compose up`)
       # porque las pruebas de falla y los experimentos apagan/recrean contenedores.
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       matriculas-api:
         condition: service_healthy
       cupos:
@@ -266,17 +331,21 @@ services:
       context: .
       dockerfile: runner/Dockerfile
     working_dir: /repo
-    entrypoint: ["python", "experiment/ejecutar_todo.py"]
+    entrypoint: ["python", "scripts/service_env.py", "python", "experiment/ejecutar_todo.py"]
     environment:
+      SERVICE_ENV_FILE: /run/config/env.json
       COMPOSE_ARGS: ""
-      API_KEY: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+      API_KEY: ${MATRICULAS_API_KEYS:-}
     volumes:
+      - config_runner:/run/config:ro
       - .:/repo
       # ATENCION: el socket de Docker equivale a root en el anfitrion. Solo se monta en estos
       # ejecutores (profiles `tests` y `experimentos`, que nunca arrancan con `docker compose up`)
       # porque las pruebas de falla y los experimentos apagan/recrean contenedores.
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
+      inicializar:
+        condition: service_completed_successfully
       matriculas-api:
         condition: service_healthy
 
@@ -285,3 +354,11 @@ volumes:
   pagos_data:
   cupos_data:
   matriculas_db_data:
+  secretos_data:
+  config_db:
+  config_api:
+  config_orquestador:
+  config_pagos:
+  config_gateway:
+  config_legacy:
+  config_runner:

@@ -16,8 +16,9 @@ La integración se implementa en `matriculas-api/`, una API REST desarrollada co
 ```text
 .
 ├── docker-compose.yml                              # orquesta TODOS los servicios (cupos + matriculas-db + matriculas-api [+ matriculas, legacy])
-├── .env.example                                    # plantilla SIN secretos; el .env real se genera con scripts/generar_env.py
-├── scripts/                                        # generar_env.py, ejecutar_tests.py, verificar_compatibilidad.py
+├── .env.example                                    # configuración opcional; secretos automáticos en volúmenes privados
+├── bootstrap/                                      # inicializador de secretos para el arranque sin .env
+├── scripts/                                        # inicialización, diagnóstico, pruebas y compatibilidad
 ├── runner/                                         # imagen y dependencias de los ejecutores de pruebas y experimentos
 ├── contrato-base/                                  # último contrato PUBLICADO (.proto y OpenAPI): base de la verificación de compatibilidad
 ├── proto/
@@ -86,18 +87,31 @@ La API conserva las API keys para integraciones máquina a máquina y añade aut
 ### Requisitos
 
 - Docker con Docker Compose.
-- Python para generar la configuración y ejecutar los scripts desde el anfitrión.
+- Python es opcional para ejecutar pruebas y herramientas desde el anfitrión.
 
 ### Levantar la integración
 
 Desde la raíz del repositorio:
 
 ```bash
-python scripts/generar_env.py
 docker compose up --build -d
 ```
 
-El primer comando genera `.env` con claves aleatorias sin sobrescribir un archivo existente. El segundo inicia Cupos, PostgreSQL, `matriculas-api`, **Pagos (Transbank Webpay Plus, ambiente de integración gratuito)**, el orquestador de Saga, el BFF y el gateway. Solo el gateway publica el puerto `8000`; los servicios de dominio quedan dentro de la red de Compose.
+Este único comando funciona desde un clon sin `.env`. El servicio `inicializar` genera
+secretos aleatorios en volúmenes persistentes, los reutiliza en los siguientes arranques
+y entrega a cada servicio solo sus credenciales. Si ya existe un `.env`, se respetan
+sus valores explícitos. Inicia Cupos, PostgreSQL, `matriculas-api`, **Pagos (Transbank
+Webpay Plus, ambiente de integración gratuito)**, el orquestador, el BFF y el gateway.
+Solo el gateway publica el puerto `8000`; los servicios de dominio quedan internos.
+
+No se necesita Python ni generación previa de archivos en el anfitrión. `scripts/generar_env.py`
+se conserva como opción para configurar una instalación antes de su primer arranque.
+Generar claves nuevas después de crear la base no cambia la contraseña persistida de
+PostgreSQL; el diagnóstico y la reparación están descritos en
+[`docs/h5-arranque-persistencia.md`](docs/h5-arranque-persistencia.md).
+
+El orquestador migra automáticamente el esquema anterior a Webpay con backup y una
+transacción, conservando sagas, pasos e idempotencia. No se eliminan volúmenes para actualizarlo.
 
 El gateway está disponible en `http://localhost:8000`. `GET /v1/bff/dashboard` devuelve cursos disponibles e inscripciones en una respuesta. La operación Saga se expone en `POST /v1/matriculas` y su consulta en `GET /v1/sagas/{id}`. Las rutas y ejemplos de autenticación están descritos en [`docs/gateway-bff.md`](docs/gateway-bff.md) y [`matriculas-api/README.md`](matriculas-api/README.md).
 
@@ -161,12 +175,18 @@ El ejecutor inicia los servicios necesarios, espera a que la API responda, ejecu
 Para preparar el entorno local, ejecutar estos comandos una sola vez o cuando cambien las dependencias:
 
 ```bash
-python scripts/generar_env.py
 python -m pip install -r tests/requirements.txt
 docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
 ```
 
 Luego, ejecutar los siguientes comandos según el objetivo:
+
+Si se arrancó sin `.env`, cargar las credenciales de pruebas desde sus servicios:
+
+```bash
+export API_KEY="$(docker compose exec -T gateway python /usr/local/bin/service_env.py python -c 'import os; print(os.environ["MATRICULAS_API_KEYS"].split(",")[0])')"
+export INSCRIPCION_WRITER_KEY="$(docker compose exec -T matriculas-api python /usr/local/bin/service_env.py python -c 'import os; print(os.environ["INSCRIPCION_WRITER_KEY"])')"
+```
 
 
 Para ejecutar la suite completa, incluidas las pruebas de falla:

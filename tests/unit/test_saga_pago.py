@@ -131,7 +131,7 @@ def test_un_esquema_anterior_se_rechaza_con_un_mensaje_claro(m, tmp_path):
     with engine.begin() as c:
         c.execute(text("CREATE TABLE sagas (id TEXT PRIMARY KEY, estado TEXT, "
                        "CHECK (estado IN ('EN_CURSO','COMPLETADA','COMPENSANDO','COMPENSADA','COMPENSACION_PENDIENTE')))"))
-    with pytest.raises(RuntimeError, match="down -v"):
+    with pytest.raises(RuntimeError, match="migración"):
         sg.verificar_esquema(engine)
 
 

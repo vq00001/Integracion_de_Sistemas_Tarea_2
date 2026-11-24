@@ -11,6 +11,7 @@ matriculas-api/app/grpc_stubs/cupos_pb2*.py
 # Dependencias y archivos de ejecución locales.
 node_modules/
 *.db
+*.db.*.bak
 
 # Resultados de experimentos y benchmarks: se ignoran los CSV sueltos, PERO los datos
 # crudos de cada corrida SÍ se versionan para que los resultados sean verificables.

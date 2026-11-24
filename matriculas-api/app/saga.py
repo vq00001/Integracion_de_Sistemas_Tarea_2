@@ -76,9 +76,11 @@ def verificar_esquema(engine):
         return
     with engine.connect() as conn:
         ddl = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='sagas'")).scalar()
-    if ddl and "ESPERANDO_PAGO" not in ddl:
+        columns = {row[1] for row in conn.execute(text('PRAGMA table_info(sagas)'))}
+    if ddl and ("ESPERANDO_PAGO" not in ddl or not {'pago_url', 'pago_expira_at'} <= columns):
         raise RuntimeError("La base de sagas tiene el esquema anterior al cobro con Webpay (falta ESPERANDO_PAGO). "
-                           "Borra el volumen sagas_data (docker compose down -v) o el archivo sagas.db.")
+                           "Requiere una migración que conserve los datos. El arranque actualizado del "
+                           "orquestador realiza la migración transaccional con copia de seguridad.")
 
 
 def _parse_utc(value):

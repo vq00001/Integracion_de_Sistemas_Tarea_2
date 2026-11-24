@@ -14,6 +14,7 @@ from .database import Base
 from .errors import register_exception_handlers
 from .saga import Orchestrator, Saga, SagaStep, snapshot, verificar_esquema
 from .saga_clients import clients_from_env
+from .saga_schema import migrar_esquema
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -37,6 +38,9 @@ def auth(x_api_key: str = Header(default="")):
 async def lifespan(app):
     if len(os.getenv("ORCHESTRATOR_API_KEY", "")) < 24:
         raise RuntimeError("ORCHESTRATOR_API_KEY debe tener al menos 24 caracteres")
+    backup = migrar_esquema(engine)
+    if backup:
+        logging.getLogger('saga').info('Esquema de sagas migrado; copia de seguridad: %s', backup.name)
     verificar_esquema(engine)
     # Solo tablas del orquestador en su base propia.
     Base.metadata.create_all(engine, tables=[Saga.__table__, SagaStep.__table__])
@@ -58,6 +62,11 @@ async def lifespan(app):
 
 app = FastAPI(title="Orquestador de Matrículas", version="2.0.0", lifespan=lifespan)
 register_exception_handlers(app)
+
+
+@app.get('/health', include_in_schema=False)
+def health():
+    return {'status': 'ok'}
 
 
 class Matricular(BaseModel):

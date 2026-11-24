@@ -1,4 +1,4 @@
-"""H5 RED: un único Compose up desde una copia limpia, sin credenciales heredadas.
+"""H5: un único Compose up desde una copia limpia, sin credenciales heredadas.
 
 Se copian fuentes versionadas y nuevas, excluyendo .env y archivos ignorados.
 La prueba de arranque usa Docker real, proyecto/volúmenes propios y puerto
@@ -13,7 +13,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import urllib.request
 import uuid
 
 import pytest
@@ -32,7 +31,7 @@ SERVICES = {'cupos', 'matriculas-db', 'matriculas-api', 'orquestador', 'pagos', 
 @pytest.fixture
 def clon(tmp_path):
     # Incluir archivos nuevos permite probar la solución antes de git add.
-    tracked = subprocess.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    tracked = subprocess.run(['git', '-c', f'safe.directory={ROOT}', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
                              cwd=ROOT, capture_output=True, check=True).stdout.decode().split('\0')
     folder = tmp_path / 'clon limpio'
     folder.mkdir()
@@ -50,6 +49,8 @@ def clon(tmp_path):
     for name in list(env):
         if name in names or name.startswith('COMPOSE_'):
             env.pop(name)
+    # El test no escribe metadatos de Buildx en el perfil Docker del usuario.
+    env['BUILDX_CONFIG'] = str(tmp_path / 'buildx')
     assert not (folder / '.env').exists()
     return folder, env
 
@@ -150,8 +151,30 @@ def test_h5_up_real_desde_clon_limpio_con_volumenes_aislados(clon):
         assert len(publishers) == 1 and publishers[0][0] == 'gateway'
         port = publishers[0][1]
         assert port['URL'] == '127.0.0.1'
-        with urllib.request.urlopen(f'http://127.0.0.1:{port["PublishedPort"]}/health', timeout=3) as response:
-            assert response.status == 200
+        # La misma prueba funciona desde el host y desde el runner: la interfaz
+        # publicada en 127.0.0.1 del daemon no es el loopback del runner. La sonda
+        # HTTP se ejecuta dentro de Gateway y nunca extrae su secreto al stdout.
+        probe_code = '''import hashlib,json,os,urllib.request
+key=os.environ['MATRICULAS_API_KEYS']
+with urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3) as response:
+    assert response.status == 200
+request=urllib.request.Request('http://127.0.0.1:8080/v1/bff/dashboard',headers={'X-API-Key':key.split(',')[0]})
+with urllib.request.urlopen(request,timeout=10) as response:
+    assert response.status == 200
+    assert {'cursos','matriculas'} <= json.load(response).keys()
+print(hashlib.sha256(key.encode()).hexdigest())
+'''
+        probe_command = ('exec', '-T', 'gateway', 'python', '/usr/local/bin/service_env.py',
+                         'python', '-c', probe_code)
+        probe = _compose(clon, *probe_command, project=project, override=override)
+        assert probe.returncode == 0, probe.stderr
+        digest = probe.stdout.strip()
+        restarted = _compose(clon, 'up', '-d', '--wait', '--wait-timeout', '120',
+                             project=project, override=override, timeout=180)
+        assert restarted.returncode == 0, restarted.stderr
+        probe = _compose(clon, *probe_command, project=project, override=override)
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout.strip() == digest, 'El segundo up rotó las credenciales'
     finally:
         cleanup = _compose(clon, 'down', '--volumes', '--remove-orphans',
                            project=project, override=override, timeout=60)

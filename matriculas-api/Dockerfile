@@ -8,6 +8,7 @@ COPY matriculas-api/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY matriculas-api/app ./app
+COPY scripts/service_env.py /usr/local/bin/service_env.py
 COPY matriculas-api/generar_stubs.py ./generar_stubs.py
 COPY proto ./proto
 
@@ -22,4 +23,5 @@ USER app
 
 EXPOSE 8000
 
+ENTRYPOINT ["python", "/usr/local/bin/service_env.py"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

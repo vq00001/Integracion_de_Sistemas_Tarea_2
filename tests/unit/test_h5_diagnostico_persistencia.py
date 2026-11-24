@@ -1,4 +1,4 @@
-"""H5 RED, adicional: comprobar PostgreSQL y datos persistidos sin modificarlos.
+"""H5, adicional: comprobar PostgreSQL y datos persistidos sin modificarlos.
 
 El CLI de reparación se ejecuta completo sobre Docker simulado: nunca alcanza
 los contenedores reales. Se separa el diagnóstico --comprobar de la reparación.
@@ -127,6 +127,20 @@ def test_h5_control_reparacion_explicita_sin_borrar_volumenes(tmp_path, monkeypa
     assert docker.auth_ok
     assert sum(kind == 'sql' for kind, _ in docker.mutations) == 1
     assert not any(kind in ('down', 'rm') for kind, _ in docker.mutations)
+
+
+def test_reparacion_con_password_correcta_no_altera_el_rol(tmp_path, monkeypatch, capsys):
+    docker = Docker()
+    result = _cli(tmp_path, monkeypatch, capsys, docker)
+    assert result.code == 0, result.output
+    assert not any(kind == 'sql' for kind, _ in docker.mutations)
+
+
+def test_reparacion_no_intenta_actualizar_una_version_mayor_de_postgres(tmp_path, monkeypatch, capsys):
+    docker = Docker(drift='version')
+    result = _cli(tmp_path, monkeypatch, capsys, docker)
+    assert result.code != 0
+    assert docker.mutations == []
 
 
 def test_h5_esquema_sagas_antiguo_orienta_a_migrar_sin_recomendar_borrar_datos(m, tmp_path):
