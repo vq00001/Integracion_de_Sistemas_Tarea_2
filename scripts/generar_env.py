@@ -27,6 +27,7 @@ def main() -> int:
     if destino.exists() and not args.forzar:
         lineas = destino.read_text(encoding="utf-8").splitlines()
         secretos = {
+            "INSCRIPCION_WRITER_KEY": secrets.token_urlsafe(32),
             "MATRICULAS_DB_PASSWORD": secrets.token_urlsafe(24),
             "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),
             "ORCHESTRATOR_API_KEY": secrets.token_urlsafe(32),
@@ -58,6 +59,7 @@ def main() -> int:
             print(".env ya existe: no se modifica (usa --forzar para regenerarlo).")
         return 0
     valores = {
+        "INSCRIPCION_WRITER_KEY": secrets.token_urlsafe(32),
         "ORCHESTRATOR_API_KEY": secrets.token_urlsafe(32),
         "INTERNAL_KEY": secrets.token_urlsafe(32),
         "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),

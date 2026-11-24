@@ -11,6 +11,7 @@ from ..database import get_db
 from ..errors import (ConflictError, EnrollmentInProgressError,
                       IdempotencyKeyReusedError, NotFoundError)
 from ..faults import aplicar_falla
+from ..enrollment_auth import require_enrollment_writer
 from ..time import utc_now
 from ..security import Principal, exigir_acceso_a_estudiante, limitar_escrituras, require_api_key
 
@@ -91,8 +92,9 @@ def _resolver_conflicto(db: Session, payload: schemas.EnrollmentCreate, client_k
     "",
     response_model=schemas.EnrollmentOut,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_enrollment_writer)],
     summary="Matricular a un estudiante en un curso",
-    description="Inscripción local idempotente. Cupos y Pagos los coordina la saga.",
+    description="Alta interna exclusiva del orquestador: requiere X-Enrollment-Writer-Key además de la autenticación habitual. Los clientes públicos deben usar POST /v1/matriculas.",
     responses={401: {"model": schemas.ErrorResponse}, 403: {"model": schemas.ErrorResponse},
                404: {"model": schemas.ErrorResponse}, 409: {"model": schemas.ErrorResponse},
                422: {"model": schemas.ErrorResponse, "description": "Unprocessable Entity"}, 429: {"model": schemas.ErrorResponse},

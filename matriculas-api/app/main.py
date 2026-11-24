@@ -89,13 +89,22 @@ def custom_openapi():
     schema.setdefault("components", {}).setdefault("securitySchemes", {})["BearerAuth"] = {
         "type": "http", "scheme": "bearer", "bearerFormat": "JWT"
     }
-    for path in schema.get("paths", {}).values():
-        for operation in path.values():
+    schema["components"]["securitySchemes"]["EnrollmentWriterAuth"] = {
+        "type": "apiKey", "in": "header", "name": "X-Enrollment-Writer-Key",
+        "description": "Credencial exclusiva del orquestador para crear inscripciones",
+    }
+    for url, path in schema.get("paths", {}).items():
+        for method, operation in path.items():
             if operation.get("tags") in (["Salud"],):
                 continue
             if operation.get("tags") == ["Autenticación"]:
                 continue
             operation["security"] = [{"ApiKeyAuth": []}, {"BearerAuth": []}]
+            if url == "/v1/enrollments" and method == "post":
+                operation["security"] = [
+                    {"ApiKeyAuth": [], "EnrollmentWriterAuth": []},
+                    {"BearerAuth": [], "EnrollmentWriterAuth": []},
+                ]
     app.openapi_schema = schema
     return schema
 

@@ -60,6 +60,16 @@ class Api:
         kw.setdefault("timeout", 10)
         return requests.request(method, f"{self.base_url}{path}", headers=headers, **kw)
 
+    def inscribir(self, **kw):
+        """Preparación interna de pruebas; nunca pasa por el gateway público."""
+        from dotenv import dotenv_values
+        writer = os.getenv("INSCRIPCION_WRITER_KEY") or dotenv_values(ROOT / ".env").get("INSCRIPCION_WRITER_KEY")
+        if not writer:
+            raise RuntimeError("Genera INSCRIPCION_WRITER_KEY con python scripts/generar_env.py")
+        headers = {**self.headers, **kw.pop("headers", {}), "X-Enrollment-Writer-Key": writer}
+        target = os.getenv("INSCRIPCION_TEST_URL", "http://localhost:8001")
+        return Api(target, None).post("/v1/enrollments", headers=headers, **kw)
+
     def get(self, path, **kw): return self.request("GET", path, **kw)
     def post(self, path, **kw): return self.request("POST", path, **kw)
     def put(self, path, **kw): return self.request("PUT", path, **kw)

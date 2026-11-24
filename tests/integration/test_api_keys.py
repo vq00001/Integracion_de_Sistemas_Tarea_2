@@ -119,7 +119,7 @@ def test_estudiante_no_lista_ni_crea_estudiantes(alumno_a):
 
 def test_estudiante_se_matricula_y_revierte_solo_a_si_mismo(alumno_a):
     est, cli = alumno_a
-    r = cli.post("/v1/enrollments", json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
+    r = cli.inscribir(json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 201, r.text
     eid = r.json()["id"]
     assert cli.get(f"/v1/enrollments/{eid}").status_code == 200
@@ -129,7 +129,7 @@ def test_estudiante_se_matricula_y_revierte_solo_a_si_mismo(alumno_a):
 def test_estudiante_no_matricula_a_otro(alumno_a, alumno_b):
     _, cli_a = alumno_a
     est_b, _ = alumno_b
-    r = cli_a.post("/v1/enrollments", json={"student_id": est_b["id"], "curso_id": CURSO_CON_CUPO})
+    r = cli_a.inscribir(json={"student_id": est_b["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 403
     # y no quedó nada creado a nombre de B
     assert not [e for e in _listar(est_b)]
@@ -143,7 +143,7 @@ def _listar(est):
 def test_matricula_ajena_se_trata_como_inexistente(alumno_a, alumno_b):
     est_a, cli_a = alumno_a
     _, cli_b = alumno_b
-    eid = cli_a.post("/v1/enrollments", json={"student_id": est_a["id"], "curso_id": CURSO_CON_CUPO}).json()["id"]
+    eid = cli_a.inscribir(json={"student_id": est_a["id"], "curso_id": CURSO_CON_CUPO}).json()["id"]
     assert cli_b.get(f"/v1/enrollments/{eid}").status_code == 404
     assert cli_b.post(f"/v1/enrollments/{eid}/revert").status_code == 404
     # la matrícula sigue confirmada (B no pudo revertirla)
@@ -156,7 +156,7 @@ def test_listado_de_matriculas_se_acota_al_propio_estudiante(api, alumno_a, alum
     est_b, cli_b = alumno_b
     ids = []
     for est, cli in ((est_a, cli_a), (est_b, cli_b)):
-        r = cli.post("/v1/enrollments", json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
+        r = cli.inscribir(json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
         assert r.status_code == 201
         ids.append(r.json()["id"])
     try:

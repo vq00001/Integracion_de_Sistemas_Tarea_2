@@ -32,7 +32,7 @@ def test_jwt_local_solo_lee_y_modifica_matriculas_propias(api, estudiante):
     usuario.headers = {"Authorization": f"Bearer {jwt}"}
     assert usuario.get(f"/v1/students/{estudiante['id']}").status_code == 200
 
-    alta = usuario.post("/v1/enrollments", json={
+    alta = usuario.inscribir(json={
         "student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO,
     })
     assert alta.status_code == 201, alta.text
@@ -50,11 +50,11 @@ def test_jwt_no_puede_leer_ni_modificar_recursos_ajenos(api, estudiante, estudia
     cli_b.headers = {"Authorization": f"Bearer {token_b}"}
 
     assert cli_a.get(f"/v1/students/{estudiante_b['id']}").status_code == 403
-    assert cli_a.post("/v1/enrollments", json={
+    assert cli_a.inscribir(json={
         "student_id": estudiante_b["id"], "curso_id": CURSO_CON_CUPO,
     }).status_code == 403
 
-    propia = cli_b.post("/v1/enrollments", json={
+    propia = cli_b.inscribir(json={
         "student_id": estudiante_b["id"], "curso_id": CURSO_CON_CUPO,
     })
     assert propia.status_code == 201, propia.text

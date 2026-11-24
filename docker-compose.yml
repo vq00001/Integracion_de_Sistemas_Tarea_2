@@ -78,6 +78,7 @@ services:
       CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
       # SIN valor por defecto: si falta, `docker compose` se niega a levantar; y si es una clave
       # publica/corta, la API se niega a arrancar. Genera .env con: python scripts/generar_env.py
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
       INTERNAL_KEY: ${INTERNAL_KEY:?Ejecuta python scripts/generar_env.py}
       API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
       JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
@@ -112,6 +113,7 @@ services:
       SAGA_DATABASE_URL: sqlite:////data/sagas.db
       ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?Ejecuta python scripts/generar_env.py}
       SERVICE_API_KEY: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
       INTERNAL_KEY: ${INTERNAL_KEY:?Falta INTERNAL_KEY}
       INSCRIPCION_URL: http://matriculas-api:8000
       PAGOS_URL: ${PAGOS_URL:-http://pagos:8000}
@@ -240,6 +242,7 @@ services:
     working_dir: /repo
     entrypoint: ["python", "scripts/ejecutar_tests.py"]
     environment:
+      INSCRIPCION_WRITER_KEY: ${INSCRIPCION_WRITER_KEY:?Ejecuta python scripts/generar_env.py}
       COMPOSE_ARGS: "-f docker-compose.yml"      # sin el override que publica puertos en el host
       MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
       # 0 por defecto: borrar volumenes ELIMINA los datos del sistema. Solo con --reset-estado

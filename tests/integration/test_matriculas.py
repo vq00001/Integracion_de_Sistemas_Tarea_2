@@ -90,7 +90,7 @@ def test_rut_con_puntos_se_guarda_normalizado(api):
 
 def test_matricula_valida(api, estudiante):
     """Valida el flujo normal: crea una matrícula activa y luego la elimina limpiamente."""
-    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO})
+    r = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 201, r.text
     m = r.json()
     assert m["estado"] == "CONFIRMADA"
@@ -99,36 +99,36 @@ def test_matricula_valida(api, estudiante):
 
 
 def test_inscripcion_no_vuelve_a_reservar_un_curso_lleno(api, estudiante, curso_lleno):
-    r = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':curso_lleno})
+    r = api.inscribir(json={'student_id':estudiante['id'],'curso_id':curso_lleno})
     assert r.status_code == 201
     api.post(f"/v1/enrollments/{r.json()['id']}/revert")
 
 
 def test_inscripcion_delega_validacion_del_curso_al_orquestador(api, estudiante):
-    r = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':999999})
+    r = api.inscribir(json={'student_id':estudiante['id'],'curso_id':999999})
     assert r.status_code == 201
     api.post(f"/v1/enrollments/{r.json()['id']}/revert")
 
 
 def test_matricula_estudiante_inexistente_da_404(api):
     """Verifica que no se permite matricular a un estudiante que no existe."""
-    r = api.post("/v1/enrollments", json={"student_id": "no-existe", "curso_id": CURSO_CON_CUPO})
+    r = api.inscribir(json={"student_id": "no-existe", "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 404
 
 
 def test_matricula_duplicada_da_409(api, estudiante):
     """Comprueba que intentar matricularse dos veces al mismo curso devuelve conflicto."""
     body = {"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}
-    primera = api.post("/v1/enrollments", json=body)
+    primera = api.inscribir(json=body)
     assert primera.status_code == 201
-    segunda = api.post("/v1/enrollments", json=body)
+    segunda = api.inscribir(json=body)
     assert segunda.status_code == 409
     api.post(f"/v1/enrollments/{primera.json()['id']}/revert")
 
 
 def test_revertir_matricula(api, estudiante):
     """Prueba que una matrícula puede revertirse y pasar a estado ANULADA."""
-    m = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}).json()
+    m = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}).json()
     assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 200
     despues = api.get(f"/v1/enrollments/{m['id']}")
     assert despues.status_code == 200 and despues.json()["estado"] == "ANULADA"
@@ -146,7 +146,7 @@ def test_inscribir_y_dar_baja_no_modifica_cupos(api, estudiante, cupos_stub):
     pb, stub = cupos_stub.pb2, cupos_stub.stub
     libres = lambda: stub.obtenerCupo(pb.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
     before = libres()
-    m = api.post('/v1/enrollments',json={'student_id':estudiante['id'],'curso_id':CURSO_CON_CUPO}).json()
+    m = api.inscribir(json={'student_id':estudiante['id'],'curso_id':CURSO_CON_CUPO}).json()
     assert libres() == before
     for _ in range(2):
         assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 200

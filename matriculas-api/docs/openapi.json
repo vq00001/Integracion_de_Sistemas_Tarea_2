@@ -1056,14 +1056,16 @@
           "Matrículas"
         ],
         "summary": "Matricular a un estudiante en un curso",
-        "description": "Inscripción local idempotente. Cupos y Pagos los coordina la saga.",
+        "description": "Alta interna exclusiva del orquestador: requiere X-Enrollment-Writer-Key además de la autenticación habitual. Los clientes públicos deben usar POST /v1/matriculas.",
         "operationId": "matricular_v1_enrollments_post",
         "security": [
           {
-            "ApiKeyAuth": []
+            "ApiKeyAuth": [],
+            "EnrollmentWriterAuth": []
           },
           {
-            "BearerAuth": []
+            "BearerAuth": [],
+            "EnrollmentWriterAuth": []
           }
         ],
         "parameters": [
@@ -1101,6 +1103,16 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "name": "x-enrollment-writer-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "X-Enrollment-Writer-Key"
             }
           }
         ],
@@ -2171,6 +2183,12 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "EnrollmentWriterAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Enrollment-Writer-Key",
+        "description": "Credencial exclusiva del orquestador para crear inscripciones"
       }
     }
   }

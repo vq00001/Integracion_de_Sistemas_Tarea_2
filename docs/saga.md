@@ -159,3 +159,24 @@ Pruebas rápidas: `python -m pytest tests/unit -q`. Cubren clientes falsos, erro
 La suite de red existente cubre Inscripción y Cupos. `test_saga_procesos.py` levanta servicios aislados con HTTP/gRPC reales y un doble explícito de Pagos: prueba los cinco escenarios, los invariantes y SIGKILL real sin Docker. Las pruebas marcadas `falla` requieren Docker. `tests/integration/test_saga_docker.py` (opt-in, marcador `falla`) requiere Docker y que Pagos apunte al simulador de Transbank (`TBK_BASE_URL`, ver `pagos/README.md`): hace de comprador, mata el orquestador con una inscripción en vuelo y espera la conciliación. El script `scripts/verificar_invariantes.py SAGA_ID...` consulta los tres servicios: COMPLETADA requiere reserva activa, COBRADO e inscripción activa; COMPENSADA requiere reserva inactiva, REEMBOLSADO/INEXISTENTE y ninguna inscripción activa de esa clave. Necesita ORCHESTRATOR_API_KEY, SERVICE_API_KEY y las URLs accesibles; usar el override de tests para acceder a gRPC desde el host.
 
 **Pagos con Webpay.** `tests/unit/test_pagos.py` prueba el servicio contra un simulador de Transbank (`tests/support/fake_transbank.py`, mismo contrato REST): ciclo del cobro, idempotencia, retorno, anulación, vencimiento, commit perdido, reembolso repetible, cancelación anticipada, circuito, bulkhead e inyección de fallas. `tests/unit/test_saga_pago.py` prueba la espera del comprador en la saga y `tests/unit/test_gateway_pagos.py` las rutas públicas del gateway. `tests/integration/test_pagos_procesos.py` levanta Cupos, Inscripción, Orquestador y **Pagos reales** (solo Transbank y el comprador son simulados) y prueba seis escenarios con invariantes en los tres servicios: camino feliz con redirección, tarjeta rechazada, falla del último paso tras pagar, pago vencido, aviso perdido y Transbank caído con circuito abierto y recuperación.
+
+
+### Alta de inscripciones protegida (H1)
+
+Los clientes matriculan mediante `POST /v1/matriculas`. El gateway rechaza
+`POST /v1/enrollments` (también con barra final), incluso con JWT o API key válidos.
+La API de Inscripción exige además `X-Enrollment-Writer-Key` para el alta: una API
+key administrativa o JWT por sí solos no permiten confirmar inscripciones.
+`INSCRIPCION_WRITER_KEY` se comparte solo entre Inscripción y el orquestador;
+no se distribuye al gateway, BFF, Pagos ni al navegador. La falta de clave bloquea
+la escritura. La saga envía la clave solo al paso INSCRIBIR. Las lecturas y bajas
+conservan su autorización anterior; esta corrección no cambia el flujo de baja global.
+
+Para actualizar una instalación existente, ejecutar `python3 scripts/generar_env.py`
+sin `--forzar` y reconstruir `matriculas-api`, `orquestador` y `api-gateway` con
+Docker Compose. El generador completa la nueva clave sin rotar las existentes.
+El perfil de tests la recibe únicamente para preparar datos por la API privada:
+`Api.inscribir()` usa INSCRIPCION_TEST_URL (puerto 8001 de loopback en el override
+de pruebas; dentro del runner, matriculas-api:8000). Ese puerto no se publica
+en el Compose de producción. Los informes anteriores de experimentos se conservan
+como evidencia histórica del defecto previo.

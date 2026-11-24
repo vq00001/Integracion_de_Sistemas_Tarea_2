@@ -258,6 +258,9 @@ def orchestrator_proxy(path: str = ""):
 # Maneja el resto de rutas no encontradas en los anteriores endpoints.
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def matriculas_proxy(path: str):
+    if request.method == "POST" and request.path.rstrip("/") == "/v1/enrollments":
+        return jsonify(error={"code": "FORBIDDEN",
+                              "message": "Para matricular usa POST /v1/matriculas"}), 403
     # /internal es solo para llamadas de la red de servicios y nunca pasa por el gateway.
     if request.path.startswith("/internal"):
         return jsonify(

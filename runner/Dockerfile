@@ -15,5 +15,6 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # y los resultados (CSV y figuras) quedan directamente en tu carpeta.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     MPLBACKEND=Agg \
+    INSCRIPCION_TEST_URL=http://matriculas-api:8000 \
     BASE_URL=http://matriculas-api:8000 \
     CUPOS_GRPC_ADDR=cupos:50051

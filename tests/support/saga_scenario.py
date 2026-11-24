@@ -41,7 +41,7 @@ env={**os.environ,'API_KEYS':admin,'JWT_SECRET':'local-test-secret-at-least-32-c
     'DATABASE_URL':f'sqlite:///{w}/inscripcion.db','DB_PATH':str(w/'cupos.db'),'GRPC_PORT':str(g),
     'CUPOS_GRPC_TARGET':f'127.0.0.1:{g}','PYTHONPATH':str(w)+os.pathsep+os.environ.get('PYTHONPATH',''),
     'SAGA_DATABASE_URL':f'sqlite:///{w}/sagas.db','ORCHESTRATOR_API_KEY':orchkey,
-    'INTERNAL_KEY':internal,'SERVICE_API_KEY':admin,'INSCRIPCION_URL':f'http://127.0.0.1:{a}',
+    'INSCRIPCION_WRITER_KEY':'isolated-saga-writer-secret-32-characters','INTERNAL_KEY':internal,'SERVICE_API_KEY':admin,'INSCRIPCION_URL':f'http://127.0.0.1:{a}',
     'PAGOS_URL':f'http://127.0.0.1:{pay.server_port}','SAGA_STALE_SECONDS':'.1',
     'SAGA_RECONCILE_SECONDS':'.1','SAGA_CB_RECOVERY_SECONDS':'.1','SAGA_CB_THRESHOLD':'10'}
 subprocess.run([py,'-m','grpc_tools.protoc',f'-I{r}/proto',f'--python_out={w}',f'--grpc_python_out={w}',str(r/'proto/cupos.proto')],check=True)

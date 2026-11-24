@@ -4,3 +4,8 @@ services:
   cupos:
     ports:
       - "127.0.0.1:50051:50051"
+
+  # Solo en pruebas, para preparar inscripciones con la clave de escritura.
+  matriculas-api:
+    ports:
+      - "127.0.0.1:8001:8000"

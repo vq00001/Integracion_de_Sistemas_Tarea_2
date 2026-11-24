@@ -23,6 +23,7 @@ from tests.conftest import ROOT, rut_valido
 from fastapi.testclient import TestClient
 
 ADMIN = secrets.token_urlsafe(32)
+WRITER = secrets.token_urlsafe(32)
 
 
 @pytest.fixture(scope="module")
@@ -35,8 +36,8 @@ def m():
     subprocess.run([sys.executable, str(api_dir / "generar_stubs.py"),
                     "--destino", str(tmp / "app" / "grpc_stubs")],
                    check=True, capture_output=True)
-    previo = {k: os.environ.get(k) for k in ("API_KEYS", "JWT_SECRET", "DATABASE_URL", "RECONCILE_INTERVAL_SECONDS")}
-    os.environ.update(API_KEYS=ADMIN, JWT_SECRET=secrets.token_urlsafe(32),
+    previo = {k: os.environ.get(k) for k in ("API_KEYS", "JWT_SECRET", "DATABASE_URL", "RECONCILE_INTERVAL_SECONDS", "INSCRIPCION_WRITER_KEY")}
+    os.environ.update(INSCRIPCION_WRITER_KEY=WRITER, API_KEYS=ADMIN, JWT_SECRET=secrets.token_urlsafe(32),
                       DATABASE_URL=f"sqlite:///{tmp / 'm.db'}", RECONCILE_INTERVAL_SECONDS="0")
     sys.path.insert(0, str(tmp))
     for nombre in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
@@ -66,7 +67,7 @@ def cliente(m):
 
 
 def _admin():
-    return {"X-API-Key": ADMIN}
+    return {"X-API-Key": ADMIN, "X-Enrollment-Writer-Key": WRITER}
 
 
 def _alumno(cliente):

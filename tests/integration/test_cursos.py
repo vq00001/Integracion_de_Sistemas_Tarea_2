@@ -49,7 +49,7 @@ def test_inscripcion_local_no_cambia_disponibilidad(api, estudiante):
     assert inicial.status_code == 200, inicial.text
     assert api.get("/v1/courses").headers["X-Cache"] == "HIT"
     antes = api.get(f"/v1/courses/{CURSO_CON_CUPO}").json()["cupos_libres"]
-    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO},
+    r = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO},
                  headers={"Idempotency-Key": str(uuid.uuid4())})
     assert r.status_code == 201
     try:

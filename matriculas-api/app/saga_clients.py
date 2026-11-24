@@ -75,13 +75,15 @@ class Client:
         return self.call(self.inquiry, saga, key)
 
 
-def http(method, url, payload, key, timeout, internal=False, api_key=None):
+def http(method, url, payload, key, timeout, internal=False, api_key=None, enrollment_writer=False):
     """`api_key` es la credencial DEL DESTINO: Pagos recibe PAGOS_API_KEY y nunca la clave de Inscripción."""
     if api_key is None:
         api_key = os.environ.get("SERVICE_API_KEY", "").split(",")[0].strip()
     headers = {"Content-Type": "application/json", "Idempotency-Key": key, "X-API-Key": api_key}
     if internal:
         headers["X-Internal-Key"] = os.environ.get("INTERNAL_KEY", "")
+    if enrollment_writer:
+        headers["X-Enrollment-Writer-Key"] = os.environ.get("INSCRIPCION_WRITER_KEY", "")
     data = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -119,7 +121,7 @@ def clients_from_env():
             raise BusinessError()
 
     def enroll(s, key, timeout):
-        result = http("POST", ins+"/v1/enrollments", dict(student_id=s["alumno_id"], curso_id=s["curso_id"]), key, timeout)
+        result = http("POST", ins+"/v1/enrollments", dict(student_id=s["alumno_id"], curso_id=s["curso_id"]), key, timeout, enrollment_writer=True)
         if result.get("estado") == "ANULADA":
             raise BusinessError()
         if result.get("estado") != "CONFIRMADA":

@@ -1,9 +1,8 @@
-"""H1 (fase RED): altas públicas deben pasar por la saga.
+"""H1 (regresión): altas públicas deben pasar por la saga.
 
 Gateway Flask, API de Inscripción y máquina de estados reales en proceso, con
 SQLite temporal. Solo el transporte HTTP y los clientes de Cupos/Pagos son dobles;
-no se accede a Docker, Webpay ni a bases del despliegue. No usar xfail: los cuatro
-casos de alta directa deben fallar hasta cerrar H1.
+no se accede a Docker, Webpay ni a bases del despliegue. Los casos de alta directa deben rechazarse sin alterar el estado.
 """
 import importlib
 import importlib.util
@@ -85,9 +84,11 @@ def sistema(m, cliente, monkeypatch, tmp_path):
     monkeypatch.setattr(orch_api, 'sessions', sessions)
     monkeypatch.setattr(orch_api, 'orchestrator', obj)
 
+    proxy_calls = []
     with TestClient(orch_api.app) as orch_client:
         def transporte(method, url, *, headers, data, timeout, allow_redirects):
             parsed = urlsplit(url)
+            proxy_calls.append((method, parsed.netloc, parsed.path))
             target = {'inscripcion.h1': cliente, 'orquestador.h1': orch_client}.get(parsed.netloc)
             assert target is not None, f'Destino inesperado: {parsed.netloc}'
             path = parsed.path + ('?' + parsed.query if parsed.query else '')
@@ -116,7 +117,7 @@ def sistema(m, cliente, monkeypatch, tmp_path):
             public=gateway.app.test_client(), alumno_id=alumno['id'],
             jwt=jwt, reservas=reservas,
             pagos=pagos, orden=orden, inscripciones=inscripciones, sagas=sagas,
-            control=control,
+            control=control, proxy_calls=proxy_calls,
         )
     engine.dispose()
 
@@ -179,3 +180,77 @@ def test_h1_saga_con_pago_pendiente_no_confirma_inscripcion(sistema, tipo):
     assert sistema.orden == ['RESERVAR', 'COBRAR']
     assert len(sistema.reservas) == 1 and list(sistema.pagos.values()) == ['PENDIENTE']
     assert sistema.inscripciones() == []
+
+
+@pytest.mark.parametrize('tipo', ['jwt', 'api_key'])
+@pytest.mark.parametrize('writer', [None, 'clave-falsa'])
+def test_h1_api_interna_tambien_rechaza_escritura_sin_clave_exclusiva(sistema, cliente, tipo, writer):
+    headers = credenciales(sistema, tipo)
+    if writer:
+        headers['X-Enrollment-Writer-Key'] = writer
+    response = cliente.post('/v1/enrollments', headers=headers,
+                            json={'student_id': sistema.alumno_id, 'curso_id': 1})
+    assert response.status_code == 403
+    assert sistema.inscripciones() == []
+
+
+@pytest.mark.parametrize('path', ['/v1/enrollments', '/v1/enrollments/'])
+def test_h1_gateway_no_reenvia_alta_ni_con_clave_escritora(sistema, path):
+    from tests.unit.test_api_unidad import WRITER
+    response = sistema.public.post(path, headers={**_admin(), 'X-Enrollment-Writer-Key': WRITER},
+                                   json={'student_id': sistema.alumno_id, 'curso_id': 1})
+    assert response.status_code == 403
+    assert sistema.inscripciones() == []
+    assert sistema.proxy_calls == []
+
+
+def test_h1_sin_configurar_clave_escritora_falla_cerrado(sistema, cliente, monkeypatch):
+    monkeypatch.delenv('INSCRIPCION_WRITER_KEY', raising=False)
+    response = cliente.post('/v1/enrollments', headers=_admin(),
+                            json={'student_id': sistema.alumno_id, 'curso_id': 1})
+    assert response.status_code == 403
+    assert sistema.inscripciones() == []
+
+
+def test_h1_adaptador_de_inscripcion_envia_credencial_exclusiva(m, monkeypatch):
+    import io
+    import json
+    adapter = importlib.import_module('app.saga_clients')
+    monkeypatch.setenv('INSCRIPCION_WRITER_KEY', 'clave-escritora-de-prueba')
+    sent = []
+    def urlopen(request, timeout):
+        sent.append(request)
+        estado = 'CONFIRMADA' if request.full_url.endswith('/v1/enrollments') else 'COBRADO'
+        return io.BytesIO(json.dumps({'estado': estado}).encode())
+    monkeypatch.setattr(adapter.urllib.request, 'urlopen', urlopen)
+    adapter.clients_from_env()['INSCRIBIR'].forward({'alumno_id': 'alumno', 'curso_id': 1}, 'saga:INSCRIBIR')
+    assert sent[0].get_header('X-enrollment-writer-key') == 'clave-escritora-de-prueba'
+    adapter.clients_from_env()['COBRAR'].forward({'alumno_id': 'alumno', 'curso_id': 1, 'monto': 100}, 'saga:COBRAR')
+    assert sent[1].get_header('X-enrollment-writer-key') is None
+
+
+def test_h1_openapi_declara_autenticacion_y_escritor_como_requisitos_conjuntos(cliente):
+    spec = cliente.get('/openapi.json').json()
+    security = spec['paths']['/v1/enrollments']['post']['security']
+    assert security and all('EnrollmentWriterAuth' in alternative for alternative in security)
+    assert all('ApiKeyAuth' in alternative or 'BearerAuth' in alternative for alternative in security)
+    assert all('EnrollmentWriterAuth' not in alternative
+               for alternative in spec['paths']['/v1/enrollments']['get']['security'])
+
+
+def test_h1_generar_env_completa_clave_sin_rotar_credenciales(tmp_path, monkeypatch):
+    from dotenv import dotenv_values
+    spec = importlib.util.spec_from_file_location('h1_generar_env', ROOT/'scripts/generar_env.py')
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    env = tmp_path/'.env'
+    env.write_text('MATRICULAS_DB_PASSWORD=conservar-db\nMATRICULAS_API_KEYS=conservar-admin\n')
+    monkeypatch.setattr(gen, 'ROOT', tmp_path)
+    monkeypatch.setattr(gen.sys, 'argv', ['generar_env.py'])
+    assert gen.main() == 0
+    first = dotenv_values(env)
+    assert len(first['INSCRIPCION_WRITER_KEY']) >= 32
+    assert first['MATRICULAS_DB_PASSWORD'] == 'conservar-db'
+    assert first['MATRICULAS_API_KEYS'] == 'conservar-admin'
+    assert gen.main() == 0
+    assert dotenv_values(env) == first

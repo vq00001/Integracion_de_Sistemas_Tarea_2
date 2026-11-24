@@ -72,11 +72,11 @@ def test_respuestas_de_estudiantes_cumplen_el_contrato(api, api_sin_auth, spec, 
 
 def test_respuestas_de_matriculas_cumplen_el_contrato(api, spec, estudiante):
     cuerpo = {"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}
-    creada = api.post("/v1/enrollments", json=cuerpo, headers={"Idempotency-Key": str(uuid.uuid4())})
+    creada = api.inscribir(json=cuerpo, headers={"Idempotency-Key": str(uuid.uuid4())})
     validar(spec, "post", "/v1/enrollments", creada)                       # 201
-    validar(spec, "post", "/v1/enrollments", api.post("/v1/enrollments", json=cuerpo))  # 409
+    validar(spec, "post", "/v1/enrollments", api.inscribir(json=cuerpo))  # 409
     validar(spec, "post", "/v1/enrollments",
-            api.post("/v1/enrollments", json={"student_id": "x", "curso_id": 1}))      # 404
+            api.inscribir(json={"student_id": "x", "curso_id": 1}))      # 404
     eid = creada.json()["id"]
     validar(spec, "get", "/v1/enrollments/{enrollment_id}", api.get(f"/v1/enrollments/{eid}"))
     validar(spec, "get", "/v1/enrollments", api.get("/v1/enrollments"))
@@ -94,6 +94,6 @@ def test_respuestas_de_api_keys_y_permisos_cumplen_el_contrato(api, spec, estudi
     cli = Api(BASE_URL, emitida.json()["api_key"])
     validar(spec, "get", "/v1/students", cli.get("/v1/students"))                    # 403
     validar(spec, "post", "/v1/enrollments",
-            cli.post("/v1/enrollments", json={"student_id": "otro", "curso_id": CURSO_CON_CUPO}))  # 403
+            cli.inscribir(json={"student_id": "otro", "curso_id": CURSO_CON_CUPO}))  # 403
     validar(spec, "delete", ruta, api.delete(f"/v1/students/{estudiante['id']}/api-key"))  # 204
     validar(spec, "delete", ruta, api.delete(f"/v1/students/{estudiante['id']}/api-key"))  # 404

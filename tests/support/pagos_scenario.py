@@ -177,18 +177,18 @@ def falla_inscripcion(**cuerpo):
 try:
     lanzar("cupos", [PY, str(ROOT / "cupos/src/server.py")], DB_PATH=str(W / "cupos.db"), GRPC_PORT=str(P_CUPOS))
     lanzar("inscripcion", [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(P_INS)],
-           API_KEYS=ADMIN, JWT_SECRET="local-test-secret-at-least-32-characters", INTERNAL_KEY=INTERNAL,
+           API_KEYS=ADMIN, JWT_SECRET="local-test-secret-at-least-32-characters", INTERNAL_KEY=INTERNAL, INSCRIPCION_WRITER_KEY="isolated-writer-test-key-32-characters",
            DATABASE_URL=f"sqlite:///{W}/inscripcion.db", CUPOS_GRPC_TARGET=f"127.0.0.1:{P_CUPOS}")
     lanzar("pagos", [PY, "-m", "uvicorn", "pagos.app.main:app", "--host", "127.0.0.1", "--port", str(P_PAGOS)],
            DATABASE_URL=f"sqlite:///{W}/pagos.db", PAGOS_API_KEY=PAGOS_KEY, PAGOS_CALLBACK_KEY=CALLBACK,
-           INTERNAL_KEY=INTERNAL, ORQUESTADOR_URL=f"http://127.0.0.1:{P_ORQ}",
+           INTERNAL_KEY=INTERNAL, INSCRIPCION_WRITER_KEY="isolated-writer-test-key-32-characters", ORQUESTADOR_URL=f"http://127.0.0.1:{P_ORQ}",
            PAGOS_PUBLIC_BASE_URL=f"http://127.0.0.1:{P_PAGOS}", TBK_BASE_URL=fake.url,
            TBK_COMMERCE_CODE="597055555532", TBK_API_KEY=TBK_SECRET, TBK_TIMEOUT_SECONDS="1.5",
            PAGOS_RECONCILE_SECONDS="0.3", PAGOS_PROCESANDO_SECONDS="0.5", PAGOS_CB_THRESHOLD="3",
            PAGOS_CB_RECOVERY_SECONDS="1.5", PAGOS_TTL_SECONDS="600")
     orq_cmd = [PY, "-m", "uvicorn", "app.orchestrator_main:app", "--host", "127.0.0.1", "--port", str(P_ORQ)]
     lanzar("orquestador", orq_cmd, SAGA_DATABASE_URL=f"sqlite:///{W}/sagas.db", ORCHESTRATOR_API_KEY=ORQ_KEY,
-           INTERNAL_KEY=INTERNAL, SERVICE_API_KEY=ADMIN, INSCRIPCION_URL=f"http://127.0.0.1:{P_INS}",
+           INTERNAL_KEY=INTERNAL, INSCRIPCION_WRITER_KEY="isolated-writer-test-key-32-characters", SERVICE_API_KEY=ADMIN, INSCRIPCION_URL=f"http://127.0.0.1:{P_INS}",
            PAGOS_URL=f"http://127.0.0.1:{P_PAGOS}", PAGOS_API_KEY=PAGOS_KEY, PAGOS_CALLBACK_KEY=CALLBACK,
            CUPOS_GRPC_TARGET=f"127.0.0.1:{P_CUPOS}", SAGA_TIMEOUT_SECONDS="3", SAGA_STALE_SECONDS="30",
            SAGA_RECONCILE_SECONDS="0.3", SAGA_PAGO_POLL_SECONDS="0.5", SAGA_PAGO_GRACIA_SECONDS="1",
