@@ -11,9 +11,10 @@ Esas operaciones pueden seguir atendiendo pagos anteriores mientras el alta est�
 abierta, si sus propios circuitos están sanos. Sus errores tampoco abren el circuito
 de cobro ni cierran los otros circuitos.
 
-El bulkhead sigue siendo uno por dependencia y acota los recursos usados por las
-llamadas de los tres tipos. Esta corrección no modifica el tratamiento de los
-rechazos del bulkhead ni el circuito interno Pagos -> Transbank.
+H2 separó los circuitos conservando entonces un bulkhead compartido. La corrección
+[H3](h3-bulkhead-saga.md) añade admisión antes de reservar y capacidad separada para
+forward, compensaciones y consultas. El circuito interno Pagos -> Transbank conserva
+su política.
 
 ## Admisión y recuperación
 

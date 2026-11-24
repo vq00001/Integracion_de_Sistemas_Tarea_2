@@ -2,6 +2,8 @@
 import hashlib
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -13,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
-from .errors import ConflictError, IdempotencyKeyReusedError
+from .errors import ConflictError, IdempotencyKeyReusedError, TooManyRequestsError
 from .time import utc_now
 
 log = logging.getLogger("saga")
@@ -121,6 +123,12 @@ class Orchestrator:
         self.retries, self.backoff, self.stale_seconds = retries, backoff, stale_seconds
         # Espera de pago: cada cuánto se consulta a Pagos, gracia tras el vencimiento y tope si Pagos no informa vencimiento.
         self.poll_seconds, self.pago_gracia, self.pago_max_seconds = poll_seconds, pago_gracia, pago_max_seconds
+        # El mismo límite que los clientes forward, antes de cualquier reserva.
+        # El permiso cubre la ejecución, no la espera del comprador en Webpay.
+        capacity = int(os.getenv("SAGA_BULKHEAD", "8"))
+        if capacity < 1:
+            raise ValueError("SAGA_BULKHEAD debe ser mayor que cero")
+        self.admission = threading.BoundedSemaphore(capacity)
 
     def transition(self, db, saga, state, step=None, duration=0):
         if step is None:
@@ -146,27 +154,45 @@ class Orchestrator:
         payload = dict(alumno_id=alumno_id, curso_id=curso_id, monto=monto)
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         with self.sessions() as db:
-            saga = Saga(idempotency_key=key, request_hash=digest, **payload)
-            db.add(saga)
+            previous = self._replay(db, key, digest)
+            if previous is not None:
+                return previous, True
+            if not self.admission.acquire(blocking=False):
+                # Otra petición pudo registrar la clave mientras se consultaba.
+                previous = self._replay(db, key, digest)
+                if previous is not None:
+                    return previous, True
+                raise TooManyRequestsError("Capacidad de sagas agotada; reintenta con la misma clave")
             try:
-                db.commit()  # claim: índices de clave y alumno/curso deciden la carrera
-            except IntegrityError:
-                db.rollback()
-                previous = db.execute(select(Saga).where(Saga.idempotency_key == key)).scalar_one_or_none()
-                if previous is None:
-                    raise ConflictError("Ya existe una saga activa para alumno y curso")
-                if previous.request_hash != digest:
-                    raise IdempotencyKeyReusedError("La clave identifica otro payload")
-                return snapshot(previous), True
-            with saga_lock(db.get_bind(), saga.id) as acquired:
-                if not acquired:
-                    return snapshot(saga), False
-                if not self.clients["COBRAR"].available:
-                    saga.motivo_fallo = "PAGOS_CIRCUITO_ABIERTO"
-                    self.transition(db, saga, "COMPENSANDO")
-                    self.transition(db, saga, "COMPENSADA")
-                    return snapshot(saga), False
-                return self._avanzar(db, saga, 0), False
+                saga = Saga(idempotency_key=key, request_hash=digest, **payload)
+                db.add(saga)
+                try:
+                    db.commit()  # claim: índices de clave y alumno/curso deciden la carrera
+                except IntegrityError:
+                    db.rollback()
+                    previous = self._replay(db, key, digest)
+                    if previous is None:
+                        raise ConflictError("Ya existe una saga activa para alumno y curso")
+                    return previous, True
+                with saga_lock(db.get_bind(), saga.id) as acquired:
+                    if not acquired:
+                        return snapshot(saga), False
+                    if not self.clients["COBRAR"].available:
+                        saga.motivo_fallo = "PAGOS_CIRCUITO_ABIERTO"
+                        self.transition(db, saga, "COMPENSANDO")
+                        self.transition(db, saga, "COMPENSADA")
+                        return snapshot(saga), False
+                    return self._avanzar(db, saga, 0), False
+            finally:
+                self.admission.release()
+
+    def _replay(self, db, key, digest):
+        previous = db.execute(select(Saga).where(Saga.idempotency_key == key)).scalar_one_or_none()
+        if previous is None:
+            return None
+        if previous.request_hash != digest:
+            raise IdempotencyKeyReusedError("La clave identifica otro payload")
+        return snapshot(previous)
 
     def _avanzar(self, db, saga, desde):
         """Ejecuta los pasos hacia adelante desde STEPS[desde]. Si el cobro requiere que el comprador
@@ -179,7 +205,8 @@ class Orchestrator:
                 result = self.clients[step].forward(snapshot(saga), row.clave)
             except Exception as exc:
                 # No se guardan cuerpos ni mensajes de terceros (pueden contener PII).
-                row.estado = "FALLIDO" if getattr(exc, "business", False) else "INCIERTO"
+                known = getattr(exc, "business", False) or not getattr(exc, "enviado", True)
+                row.estado = "FALLIDO" if known else "INCIERTO"
                 row.error = type(exc).__name__
                 saga.motivo_fallo = f"{step}:{row.error}"
                 self.transition(db, saga, row.estado, step, time.monotonic()-start)
@@ -212,10 +239,17 @@ class Orchestrator:
                 row = db.execute(select(SagaStep).where(SagaStep.saga_id == saga.id,
                                  SagaStep.paso == "COBRAR", SagaStep.tipo == "forward")).scalar_one()
                 if estado_pago == "COBRADO":
-                    row.estado = "OK"
-                    self.transition(db, saga, "OK", "COBRAR")
-                    self.transition(db, saga, "EN_CURSO")
-                    return self._avanzar(db, saga, STEPS.index("COBRAR") + 1)
+                    if not self.admission.acquire(blocking=False):
+                        # Conservar ESPERANDO_PAGO: el próximo sondeo reanudará
+                        # la inscripción sin compensar un cobro sano por carga.
+                        return snapshot(saga)
+                    try:
+                        row.estado = "OK"
+                        self.transition(db, saga, "OK", "COBRAR")
+                        self.transition(db, saga, "EN_CURSO")
+                        return self._avanzar(db, saga, STEPS.index("COBRAR") + 1)
+                    finally:
+                        self.admission.release()
                 # RECHAZADO / ABORTADO / EXPIRADO: Pagos garantiza que no habrá cobro, no hay nada que reembolsar.
                 row.estado, row.error = "FALLIDO", estado_pago
                 saga.motivo_fallo = f"COBRAR:{estado_pago}"
@@ -277,7 +311,8 @@ class Orchestrator:
                 try:
                     self.clients[step].compensate(snapshot(saga), row.clave, forward.clave)
                 except Exception as exc:
-                    row.estado, row.error = "INCIERTO", type(exc).__name__
+                    row.estado = "INCIERTO" if getattr(exc, "enviado", True) else "FALLIDO"
+                    row.error = type(exc).__name__
                     self.transition(db, saga, row.estado, step, time.monotonic()-start)
                     if attempt+1 < self.retries:
                         time.sleep(self.backoff * 2**attempt)

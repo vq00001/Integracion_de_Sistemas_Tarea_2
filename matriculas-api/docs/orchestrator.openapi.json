@@ -73,6 +73,25 @@
             },
             "description": "Accepted"
           },
+          "429": {
+            "description": "Capacidad de sagas agotada; sin efectos laterales",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Segundos antes de reintentar con la misma clave"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "503": {
             "content": {
               "application/json": {

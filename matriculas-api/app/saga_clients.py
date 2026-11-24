@@ -21,7 +21,13 @@ class IdempotencyConflict(BusinessError):
 
 
 class DependencyFailure(Exception):
-    pass
+    # Una llamada que empezó puede haber producido efectos aunque no responda.
+    enviado = True
+
+
+class LocalRejection(DependencyFailure):
+    """La dependencia no fue llamada; no hay un efecto incierto que deshacer."""
+    enviado = False
 
 
 class Client:
@@ -36,7 +42,13 @@ class Client:
         }
         # Compatibilidad: available y las métricas existentes observan el forward.
         self.breaker = self.breakers["forward"]
-        self.semaphore = threading.BoundedSemaphore(capacity)
+        # Consultas y compensaciones tienen capacidad reservada: no consumen los
+        # permisos forward protegidos por la admisión de nuevas sagas.
+        self.semaphores = {
+            kind: threading.BoundedSemaphore(capacity)
+            for kind in self.breakers
+        }
+        self.semaphore = self.semaphores["forward"]
         self.rejected = 0
         self.seconds = 0.0
         self.calls = 0
@@ -46,16 +58,17 @@ class Client:
     def available(self):
         return self.breaker.state != CircuitState.OPEN
 
-    def call(self, fn, *args, breaker=None):
+    def call(self, fn, *args, breaker=None, semaphore=None):
         breaker = self.breaker if breaker is None else breaker
-        if not self.semaphore.acquire(blocking=False):
+        semaphore = self.semaphore if semaphore is None else semaphore
+        if not semaphore.acquire(blocking=False):
             with self.lock:
                 self.rejected += 1
-            raise DependencyFailure("Bulkhead lleno")
+            raise LocalRejection("Bulkhead lleno")
         start = time.monotonic()
         try:
             if not breaker.allow_request():
-                raise DependencyFailure("Circuito abierto")
+                raise LocalRejection("Circuito abierto")
             try:
                 result = fn(*args, timeout=self.timeout)
             except BusinessError:
@@ -70,17 +83,19 @@ class Client:
             with self.lock:
                 self.seconds += time.monotonic()-start
                 self.calls += 1
-            self.semaphore.release()
+            semaphore.release()
 
     def forward(self, saga, key):
         return self.call(self.operation, saga, key)
 
     def compensate(self, saga, key, original):
-        return self.call(self.compensation, saga, key, original, breaker=self.breakers["compensacion"])
+        return self.call(self.compensation, saga, key, original,
+                         breaker=self.breakers["compensacion"], semaphore=self.semaphores["compensacion"])
 
     def query(self, saga, key):
-        """Consulta con circuito propio; comparte el límite de recursos de la dependencia."""
-        return self.call(self.inquiry, saga, key, breaker=self.breakers["consulta"])
+        """Consulta con circuito y capacidad propios, sin desplazar cobros ni reembolsos."""
+        return self.call(self.inquiry, saga, key, breaker=self.breakers["consulta"],
+                         semaphore=self.semaphores["consulta"])
 
 
 def http(method, url, payload, key, timeout, internal=False, api_key=None, enrollment_writer=False):

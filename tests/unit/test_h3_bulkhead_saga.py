@@ -1,4 +1,4 @@
-"""H3, fase RED: sobrecarga local sin efectos inciertos ni recursos huérfanos.
+"""Regresiones H3: sobrecarga local sin efectos inciertos ni recursos huérfanos.
 
 API, Orchestrator, Client, breakers y SQLite reales en proceso. Los callbacks de
 Cupos/Pagos/Inscripción son dobles idempotentes sanos con estado verificable.
@@ -28,7 +28,7 @@ def _payload(sid):
 @pytest.fixture(autouse=True)
 def _capacidad_de_prueba(monkeypatch):
     # Configurar antes de construir Orchestrator y Client, también para la
-    # futura admisión global. Usar la configuración productiva ya existente.
+    # admisión global. Usar la configuración productiva ya existente.
     monkeypatch.setenv('SAGA_BULKHEAD', '1')
 
 
@@ -124,7 +124,7 @@ def test_h3_control_timeout_puede_haber_sido_enviado(entorno):
 def test_h3_saga_ya_admitida_no_compensa_un_paso_rechazado_localmente(entorno, step):
     e = entorno
     sid = str(uuid.uuid4())
-    # Probar la máquina de estados de una saga ya admitida/reanudada. La futura
+    # Probar la máquina de estados de una saga ya admitida/reanudada. La
     # admisión HTTP no reemplaza esta protección frente a rechazos locales tardíos.
     with e.sessions() as db:
         saga = e.sg.Saga(id=sid, idempotency_key=sid, request_hash='h3',
@@ -308,3 +308,150 @@ def test_h3_control_replay_en_curso_no_duplica_reservas_ni_cobros(api):
     assert replay.json()['id'] == completed.json()['id']
     assert len(e.reservas) == len(e.pagos) == len(e.inscripciones) == 1
     assert len(e.history) == 3
+
+
+def test_h3_sobrecarga_no_registra_saga_y_permite_reintentar_la_misma_clave(api):
+    from tests.contract.test_openapi_contract import validar
+
+    e = api.env
+    first_key, first_alumno = str(uuid.uuid4()), str(uuid.uuid4())
+    retry_key, retry_alumno = str(uuid.uuid4()), str(uuid.uuid4())
+    _bloquear_cobro_de(e, first_alumno)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        original = pool.submit(_matricular, api, first_key, first_alumno)
+        try:
+            assert e.started.wait(3)
+            rejected = _matricular(api, retry_key, retry_alumno)
+            assert rejected.status_code == 429
+            assert int(rejected.headers['Retry-After']) >= 1
+            assert rejected.json()['error']['code'] == 'TOO_MANY_REQUESTS'
+            validar(api.client.get('/openapi.json').json(), 'post', '/v1/matriculas', rejected)
+            with e.sessions() as db:
+                assert db.scalar(select(e.sg.Saga).where(e.sg.Saga.idempotency_key == retry_key)) is None
+            # La saturación tampoco oculta el uso incorrecto de una clave registrada.
+            assert _matricular(api, first_key, retry_alumno).status_code == 422
+        finally:
+            e.release.set()
+        assert original.result(timeout=3).status_code == 201
+    recovered = _matricular(api, retry_key, retry_alumno)
+    assert recovered.status_code == 201
+    assert recovered.headers.get('Idempotent-Replayed') is None
+    assert len(e.reservas) == len(e.pagos) == len(e.inscripciones) == 2
+
+
+def test_h3_conflicto_de_claim_no_pierde_el_permiso_de_admision(api):
+    alumno = str(uuid.uuid4())
+    assert _matricular(api, alumno=alumno).status_code == 201
+    assert _matricular(api, alumno=alumno).status_code == 409
+    assert _matricular(api).status_code == 201
+
+
+def test_h3_error_inesperado_libera_admision_para_otras_sagas(entorno, monkeypatch):
+    e = entorno
+    def crash(*args):
+        raise RuntimeError('Caída antes del primer efecto')
+    with monkeypatch.context() as patch:
+        patch.setattr(e.obj, '_avanzar', crash)
+        with pytest.raises(RuntimeError):
+            e.obj.matricular(str(uuid.uuid4()), str(uuid.uuid4()), 1, 100)
+    result, _ = e.obj.matricular(str(uuid.uuid4()), str(uuid.uuid4()), 1, 100)
+    assert result['estado'] == 'COMPLETADA'
+    assert len(e.history) == 3
+
+
+def test_h3_espera_webpay_libera_admision_y_reanudacion_saturada_se_pospone(entorno):
+    e = entorno
+    charge = e.clients['COBRAR'].operation
+    def pendiente(saga, key, timeout):
+        charge(saga, key, timeout=timeout)
+        return {'estado': 'PENDIENTE', 'redirect_url': 'http://webpay.test/pagar'}
+    e.clients['COBRAR'].operation = pendiente
+    waiting, _ = e.obj.matricular('esperando', 'comprador', 1, 100)
+    assert waiting['estado'] == 'ESPERANDO_PAGO'
+    # Simular otra saga sana ocupando el cupo de ejecución.
+    e.clients['COBRAR'].operation = charge
+    _bloquear_cobro_de(e, 'otro-comprador')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(e.obj.matricular, 'otra-clave', 'otro-comprador', 1, 100)
+        try:
+            assert e.started.wait(3), 'La espera del comprador retuvo el permiso de admisión'
+            history = list(e.history)
+            deferred = e.obj.pago_resuelto(waiting['id'], 'COBRADO')
+            assert deferred['estado'] == 'ESPERANDO_PAGO'
+            assert e.history == history
+            assert _resources(e, waiting['id']) == (True, 'COBRADO', False)
+        finally:
+            e.release.set()
+        assert other.result(timeout=3)[0]['estado'] == 'COMPLETADA'
+    e.clients['COBRAR'].inquiry = lambda *args, **kwargs: {'estado': 'COBRADO'}
+    completed = e.obj.sondear_pago(waiting['id'])
+    assert completed['estado'] == 'COMPLETADA'
+    assert e.obj.pago_resuelto(waiting['id'], 'COBRADO')['estado'] == 'COMPLETADA'
+    assert e.history.count(('forward', 'INSCRIBIR', waiting['id'])) == 1
+    assert not any(kind == 'compensacion' for kind, _, _ in e.history)
+
+
+def test_h3_consulta_saturada_no_desplaza_forward_ni_compensacion(entorno):
+    e = entorno
+    started, release = threading.Event(), threading.Event()
+    def inquiry(*args, **kwargs):
+        started.set()
+        assert release.wait(3)
+        return {'estado': 'COBRADO'}
+    client = e.clients['COBRAR']
+    client.inquiry = inquiry
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        query = pool.submit(client.query, _payload('consulta'), 'consulta:COBRAR')
+        try:
+            assert started.wait(3)
+            client.forward(_payload('victima'), 'victima:COBRAR')
+            client.compensate(_payload('victima'), 'victima:comp:COBRAR', 'victima:COBRAR')
+            assert e.pagos['victima'] == 'REEMBOLSADO'
+            with pytest.raises(e.sc.LocalRejection) as rejected:
+                client.query(_payload('consulta-2'), 'consulta-2:COBRAR')
+            assert rejected.value.enviado is False
+        finally:
+            release.set()
+        assert query.result(timeout=3) == {'estado': 'COBRADO'}
+
+
+def test_h3_capacidad_de_compensacion_tambien_es_acotada(entorno):
+    e = entorno
+    started, release = threading.Event(), threading.Event()
+    client = e.clients['COBRAR']
+    compensate = client.compensation
+    def gated(*args, **kwargs):
+        started.set()
+        assert release.wait(3)
+        return compensate(*args, **kwargs)
+    client.compensation = gated
+    client.forward(_payload('victima'), 'victima:COBRAR')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        refund = pool.submit(client.compensate, _payload('victima'),
+                             'victima:comp:COBRAR', 'victima:COBRAR')
+        try:
+            assert started.wait(3)
+            with pytest.raises(e.sc.LocalRejection) as rejected:
+                client.compensate(_payload('otra'), 'otra:comp:COBRAR', 'otra:COBRAR')
+            assert rejected.value.enviado is False
+            client.forward(_payload('sana'), 'sana:COBRAR')
+            assert client.breakers['compensacion'].state.value == 'CLOSED'
+        finally:
+            release.set()
+        refund.result(timeout=3)
+    assert e.pagos['victima'] == 'REEMBOLSADO'
+
+
+def test_h3_circuito_abierto_es_rechazo_conocido_sin_llamar_al_destino(entorno):
+    e = entorno
+    existing = e.clients['COBRAR']
+    client = e.sc.Client(existing.operation, existing.compensation, threshold=1, capacity=1)
+    # Abrir el circuito con una llamada real que no respondió.
+    e.timeout_step = 'COBRAR'
+    with pytest.raises(e.sc.DependencyFailure):
+        client.forward(_payload('incierta'), 'incierta:COBRAR')
+    history = list(e.history)
+    with pytest.raises(e.sc.LocalRejection) as rejected:
+        client.forward(_payload('no-enviada'), 'no-enviada:COBRAR')
+    assert rejected.value.enviado is False
+    assert e.history == history

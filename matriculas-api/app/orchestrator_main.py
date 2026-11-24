@@ -82,6 +82,9 @@ errors[422]["description"] = "Unprocessable Entity"
 
 @app.post("/v1/matriculas", response_model=SagaOut, dependencies=[Depends(auth)],
           responses={200: {"model": SagaOut}, 201: {"model": SagaOut}, 202: {"model": SagaOut},
+                     429: {"model": ErrorResponse, "description": "Capacidad de sagas agotada; sin efectos laterales",
+                           "headers": {"Retry-After": {"schema": {"type": "integer", "minimum": 1},
+                                                       "description": "Segundos antes de reintentar con la misma clave"}}},
                      503: {"model": SagaOut}, **errors})
 def matricular(payload: Matricular, response: Response,
                idempotency_key: str = Header(min_length=1, max_length=128)):
