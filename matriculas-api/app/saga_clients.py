@@ -28,7 +28,14 @@ class Client:
     def __init__(self, operation, compensation, timeout=2, capacity=8, threshold=5, recovery=15, inquiry=None):
         self.operation, self.compensation, self.timeout = operation, compensation, timeout
         self.inquiry = inquiry
-        self.breaker = CircuitBreaker(threshold, recovery)
+        # La disponibilidad de un alta no se demuestra reembolsando o consultando.
+        # Cada operación conserva su historial y su propia sonda HALF_OPEN.
+        self.breakers = {
+            kind: CircuitBreaker(threshold, recovery)
+            for kind in ("forward", "compensacion", "consulta")
+        }
+        # Compatibilidad: available y las métricas existentes observan el forward.
+        self.breaker = self.breakers["forward"]
         self.semaphore = threading.BoundedSemaphore(capacity)
         self.rejected = 0
         self.seconds = 0.0
@@ -39,24 +46,25 @@ class Client:
     def available(self):
         return self.breaker.state != CircuitState.OPEN
 
-    def call(self, fn, *args):
+    def call(self, fn, *args, breaker=None):
+        breaker = self.breaker if breaker is None else breaker
         if not self.semaphore.acquire(blocking=False):
             with self.lock:
                 self.rejected += 1
             raise DependencyFailure("Bulkhead lleno")
         start = time.monotonic()
         try:
-            if not self.breaker.allow_request():
+            if not breaker.allow_request():
                 raise DependencyFailure("Circuito abierto")
             try:
                 result = fn(*args, timeout=self.timeout)
             except BusinessError:
-                self.breaker.record_success()
+                breaker.record_success()
                 raise
             except Exception as exc:
-                self.breaker.record_failure()
+                breaker.record_failure()
                 raise DependencyFailure(type(exc).__name__) from exc
-            self.breaker.record_success()
+            breaker.record_success()
             return result
         finally:
             with self.lock:
@@ -68,11 +76,11 @@ class Client:
         return self.call(self.operation, saga, key)
 
     def compensate(self, saga, key, original):
-        return self.call(self.compensation, saga, key, original)
+        return self.call(self.compensation, saga, key, original, breaker=self.breakers["compensacion"])
 
     def query(self, saga, key):
-        """Consulta de solo lectura al servicio (pasa por el mismo circuito y bulkhead)."""
-        return self.call(self.inquiry, saga, key)
+        """Consulta con circuito propio; comparte el límite de recursos de la dependencia."""
+        return self.call(self.inquiry, saga, key, breaker=self.breakers["consulta"])
 
 
 def http(method, url, payload, key, timeout, internal=False, api_key=None, enrollment_writer=False):

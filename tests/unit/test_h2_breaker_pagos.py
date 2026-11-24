@@ -1,10 +1,9 @@
-"""H2, fase RED: cobro y operaciones auxiliares no deben compartir salud.
+"""H2: cobro y operaciones auxiliares conservan historiales independientes.
 
 Se usan el Client y los adaptadores de Pagos reales y, en el caso HTTP, la API y
 la saga persistente reales (SQLite temporal). El transporte de Pagos es un doble
 con timeouts y reloj virtual: sin sleeps, Docker, Transbank ni pagos reales.
-Los tests que reproducen H2 NO llevan xfail; los controles de recuperación ya
-funcionan con el breaker actual y deben seguir funcionando tras corregirlo.
+Los tests conservan las regresiones de la fase RED y los controles de recuperación.
 """
 import importlib
 import threading
@@ -25,7 +24,7 @@ from tests.unit.test_saga import setup_saga  # noqa: F401
 def pagos(m, monkeypatch):
     sc = importlib.import_module('app.saga_clients')
     cb = importlib.import_module('app.circuit_breaker')
-    env = SimpleNamespace(sc=sc, now=100., mode='timeout', calls=[],
+    env = SimpleNamespace(sc=sc, now=100., mode='timeout', calls=[], aux_timeout=set(),
                           started=threading.Event(), release=threading.Event())
     # Cambiar solo el reloj del módulo del breaker, no time.monotonic global:
     # TestClient, locks y futuros conservan sus relojes reales.
@@ -48,9 +47,13 @@ def pagos(m, monkeypatch):
             return {'estado': 'COBRADO'}
         if method == 'POST' and path == '/v1/payments/refund':
             env.calls.append('REEMBOLSAR')
+            if 'reembolso' in env.aux_timeout:
+                raise TimeoutError('Reembolso lento')
             return {'estado': 'REEMBOLSADO'}
         if method == 'GET' and path.startswith('/v1/payments/by-key/'):
             env.calls.append('CONSULTAR')
+            if 'consulta' in env.aux_timeout:
+                raise TimeoutError('Consulta lenta')
             return {'estado': 'COBRADO'}
         raise AssertionError(f'Operación inesperada: {method} {path}')
 
@@ -167,7 +170,7 @@ def test_h2_api_tras_cinco_sagas_fallidas_rechaza_sin_reservar_ni_llamar_pagos(
         assert events.count('INSCRIBIR') == 1
 
 
-# Controles: estas pruebas de recuperación deben pasar también antes de corregir H2.
+# Controles de las transiciones y de la sonda única del circuito forward.
 def test_h2_control_sonda_de_cobro_exitosa_cierra_y_reanuda(pagos):
     _abrir_solo_con_cobros(pagos)
     pagos.now += 15
@@ -193,7 +196,9 @@ def test_h2_control_sonda_fallida_reabre_y_reinicia_cooldown(pagos):
     assert pagos.client.breaker.state.value == 'HALF_OPEN'
 
 
-def test_h2_control_half_open_permite_una_sola_sonda(pagos):
+@pytest.mark.parametrize('auxiliar', [None, 'reembolso', 'consulta'],
+                         ids=['solo-sonda', 'con-reembolso', 'con-consulta'])
+def test_h2_control_half_open_permite_una_sola_sonda(pagos, auxiliar):
     _abrir_solo_con_cobros(pagos)
     pagos.now += 15
     pagos.mode = 'sonda'
@@ -201,6 +206,9 @@ def test_h2_control_half_open_permite_una_sola_sonda(pagos):
         future = pool.submit(pagos.client.forward, pagos.saga, 'sonda')
         try:
             assert pagos.started.wait(2)
+            if auxiliar is not None:
+                _auxiliar(pagos, auxiliar)
+                assert pagos.client.breaker.state.value == 'HALF_OPEN'
             _fallar_cobro(pagos)  # no se admite una segunda sonda simultánea
             assert pagos.client.breaker.state.value == 'HALF_OPEN'
             assert pagos.calls.count('COBRAR') == 6
@@ -208,3 +216,50 @@ def test_h2_control_half_open_permite_una_sola_sonda(pagos):
             pagos.release.set()
         assert future.result(timeout=2) == {'estado': 'COBRADO'}
     assert pagos.client.breaker.state.value == 'CLOSED'
+
+
+@pytest.mark.parametrize('operacion,kind,other', [
+    ('reembolso', 'compensacion', 'consulta'), ('consulta', 'consulta', 'compensacion')])
+def test_h2_falla_auxiliar_tiene_umbral_y_recuperacion_propios(pagos, operacion, kind, other):
+    pagos.aux_timeout.add(operacion)
+    for _ in range(5):
+        with pytest.raises(pagos.sc.DependencyFailure):
+            _auxiliar(pagos, operacion)
+    assert pagos.client.breakers[kind].state.value == 'OPEN'
+    assert pagos.client.breaker.state.value == 'CLOSED' and pagos.client.available
+    assert pagos.client.breakers[other].state.value == 'CLOSED'
+    before = list(pagos.calls)
+    with pytest.raises(pagos.sc.DependencyFailure):
+        _auxiliar(pagos, operacion)
+    assert pagos.calls == before  # rechazo del auxiliar sin tocar la dependencia
+    pagos.mode = 'sano'
+    assert pagos.client.forward(pagos.saga, 'nuevo-cobro') == {'estado': 'COBRADO'}
+    _auxiliar(pagos, 'consulta' if operacion == 'reembolso' else 'reembolso')
+    assert pagos.client.breakers[kind].state.value == 'OPEN'  # otros éxitos no lo cierran
+    pagos.aux_timeout.clear()
+    pagos.now += 15
+    _auxiliar(pagos, operacion)
+    assert pagos.client.breakers[kind].state.value == 'CLOSED'
+
+
+def test_h2_metricas_distinguen_forward_de_compensacion_y_consulta(setup_saga, pagos, monkeypatch):
+    _, obj, sessions, _, _ = setup_saga
+    _abrir_solo_con_cobros(pagos)
+    _auxiliar(pagos, 'reembolso')
+    _auxiliar(pagos, 'consulta')
+    api = importlib.import_module('app.orchestrator_main')
+    monkeypatch.setenv('ORCHESTRATOR_API_KEY', 'h2-metrics-api-key-with-at-least-32-characters')
+    monkeypatch.setattr(obj, 'clients', {'COBRAR': pagos.client})
+    monkeypatch.setattr(api, 'orchestrator', obj)
+    monkeypatch.setattr(api, 'sessions', sessions)
+    monkeypatch.setattr(api, 'engine', sessions.kw['bind'])
+    with TestClient(api.app) as client:
+        response = client.get('/metrics')
+    assert response.status_code == 200
+    # La métrica original sigue representando la admisión del cobro.
+    assert 'circuito_estado{dependencia="COBRAR",estado="OPEN"} 1' in response.text
+    for operation, expected in [('forward', 'OPEN'), ('compensacion', 'CLOSED'), ('consulta', 'CLOSED')]:
+        for state in ('CLOSED', 'OPEN', 'HALF_OPEN'):
+            series = (f'saga_circuito_operacion_estado{{dependencia="COBRAR",'
+                      f'operacion="{operation}",estado="{state}"}} {int(state == expected)}')
+            assert series in response.text

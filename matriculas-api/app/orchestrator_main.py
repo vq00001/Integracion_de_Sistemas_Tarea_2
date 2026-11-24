@@ -137,8 +137,14 @@ def metrics():
         count = db.scalar(select(func.count()).select_from(SagaStep).where(SagaStep.tipo == "compensacion", SagaStep.estado == "OK"))
         lines.append(f'compensaciones_total {count}')
     for name, client in orchestrator.clients.items():
+        # La serie histórica mantiene su significado: admisión de pasos forward.
+        forward_state = client.breaker.state.value
         for state in ("CLOSED", "OPEN", "HALF_OPEN"):
-            lines.append(f'circuito_estado{{dependencia="{name}",estado="{state}"}} {int(client.breaker.state.value == state)}')
+            lines.append(f'circuito_estado{{dependencia="{name}",estado="{state}"}} {int(forward_state == state)}')
+        for operation, breaker in client.breakers.items():
+            operation_state = breaker.state.value
+            for state in ("CLOSED", "OPEN", "HALF_OPEN"):
+                lines.append(f'saga_circuito_operacion_estado{{dependencia="{name}",operacion="{operation}",estado="{state}"}} {int(operation_state == state)}')
         lines.extend([f'bulkhead_rechazos_total{{dependencia="{name}"}} {client.rejected}',
                       f'paso_duracion_seconds_sum{{paso="{name}"}} {client.seconds}',
                       f'paso_duracion_seconds_count{{paso="{name}"}} {client.calls}'])
