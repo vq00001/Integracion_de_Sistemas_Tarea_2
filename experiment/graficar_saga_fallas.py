@@ -30,6 +30,12 @@ COLOR = {"con_patron": "#1f77b4", "sin_patron": "#d62728"}
 FASES = ("antes", "pagos_lento", "pagos_recuperacion", "lenta", "alivio", "bulkhead", "pico", "caida", "recuperacion")
 ACEPTADAS = (201, 202)  # 202 = matrícula en espera de pago; 201 = cobro creado (fase de carga directa a Pagos)
 RAPIDA = 0.2  # una respuesta "rápida" (fail-fast) tarda menos de 200 ms
+TBK_OPERACIONES = ("crear", "confirmar", "estado", "reembolsar")
+TBK_CONTADORES = {
+    "pagos_tbk_protegidos": "intentos_protegidos_tbk",
+    "pagos_tbk_fallas_simuladas": "fallas_simuladas_tbk",
+    "pagos_tbk_cliente_inicios": "inicios_cliente_tbk",
+}
 
 
 def _rel(ruta: Path) -> Path:
@@ -58,7 +64,8 @@ def _leer(ts: str, nombre: str):
 def _valor_en(m, t, col):
     if col not in m:
         return np.nan
-    s = m[(m.t <= t) & m[col].notna()]
+    # No sustituir una última muestra ausente por una lectura anterior aparentemente válida.
+    s = m[m.t <= t]
     return float(s[col].iloc[-1]) if len(s) else np.nan
 
 
@@ -72,10 +79,11 @@ def tabla_por_rep(d):
         for rep in sorted(d['fases'].loc[d['fases'].variante == v, 'rep'].unique()):
             rq0, sd, mt, fs = _sel(d, v, rep)
             mt = mt.sort_values('t', kind='stable')
-            counters = [c for c in mt if c.startswith(('orq_intentos_', 'orq_bulkhead_rech_')) or c in
+            counters = [c for c in mt if c.startswith(('orq_intentos_', 'orq_bulkhead_rech_', *TBK_CONTADORES)) or c in
                         ('pagos_tbk_intentos', 'pagos_bulkhead_rech', 'pagos_circuito_rech', 'orq_admision_rech', 'orq_compensaciones')]
             for col in counters:
-                if (mt[col].dropna().diff() < 0).any():
+                values = pd.to_numeric(mt[col].dropna(), errors='raise')
+                if not np.isfinite(values).all() or (values < 0).any() or (values.diff() < 0).any():
                     raise ValueError(f'Contador reiniciado: {col}, {v}, rep {rep}; la métrica no permite calcular deltas')
             for _, f in fs.iterrows():
                 r = rq0[(rq0.fase == f.fase) & (rq0.codigo != -1)]
@@ -85,8 +93,8 @@ def tabla_por_rep(d):
                     if col not in mt:
                         return np.nan
                     if 'punto' in phase_metrics:
-                        a = phase_metrics[phase_metrics.punto == 'inicio'][col].dropna()
-                        b = phase_metrics[phase_metrics.punto == 'fin'][col].dropna()
+                        a = phase_metrics[phase_metrics.punto == 'inicio'][col]
+                        b = phase_metrics[phase_metrics.punto == 'fin'][col]
                         return float(b.iloc[-1]-a.iloc[0]) if len(a) and len(b) else np.nan
                     return _valor_en(mt, f.t_fin, col)-_valor_en(mt, f.t_ini, col)
                 def peak(col):
@@ -108,7 +116,14 @@ def tabla_por_rep(d):
                     consultas_a_pagos=delta('orq_intentos_COBRAR_consulta'),
                     orq_cobros_en_vuelo_max=peak('orq_en_vuelo_COBRAR_forward'),
                     rechazos_bulkhead_pagos=delta('pagos_bulkhead_rech'),
-                    rechazos_circuito_tbk=delta('pagos_circuito_rech'), intentos_a_tbk=delta('pagos_tbk_intentos'))
+                    rechazos_circuito_tbk=delta('pagos_circuito_rech'),
+                    intentos_legacy_tbk=delta('pagos_tbk_intentos'))
+                for raw, output in TBK_CONTADORES.items():
+                    row[output] = delta(raw)
+                    for op in TBK_OPERACIONES:
+                        row[f'{output}_{op}'] = delta(f'{raw}_{op}')
+                # Alias de tabla corregido: solo evidencia explícita de inicios, nunca CSV legacy.
+                row['intentos_a_tbk'] = row['inicios_cliente_tbk']
                 for name, short in [('orq_sagas','orq'), ('ins_enrollments','ins'), ('pagos_health','pagos')]:
                     probes = s[s.sonda == name]
                     row[f'sonda_{short}_p95_s'] = probes.latencia_s.quantile(.95)
@@ -121,6 +136,13 @@ def tabla_agregada(por_rep: pd.DataFrame) -> pd.DataFrame:
     num = [c for c in por_rep.columns if c not in ("variante", "rep", "fase", "destino")]
     g = por_rep.groupby(["variante", "fase"], sort=False)
     t = g[num].median()
+    # Una mediana parcial no demuestra la medición de todas las repeticiones.
+    for col in num:
+        if col == 'intentos_a_tbk' or col.startswith(tuple(TBK_CONTADORES.values())):
+            valid = g[col].count()
+            t[col] = t[col].where(valid == g.size())
+            if col in TBK_CONTADORES.values():
+                t[f'n_reps_{col}'] = valid
     t["p95_s_min"], t["p95_s_max"] = g["p95_s"].min(), g["p95_s"].max()
     t["p50_s_min"], t["p50_s_max"] = g["p50_s"].min(), g["p50_s"].max()
     t["n_reps"], t["destino"] = g["rep"].nunique(), g["destino"].first()
@@ -156,17 +178,30 @@ def fig_cascada(d, ts):
             axes[1,j].plot(rows.t, rows.latencia_s, label=name, lw=.8)
         axes[1,j].set_ylabel('Sondas (s)'); axes[1,j].legend(fontsize=8)
         mapping = {'CLOSED':0, 'HALF_OPEN':1, 'OPEN':2}
-        for col, label in [('orq_cb_COBRAR','Orq→Pagos (crear)'), ('pagos_cb','Pagos→Transbank')]:
+        for col, label in [('orq_cb_COBRAR','Orq→Pagos (crear)'), ('pagos_cb','Pagos→Transbank (crear)')]:
             axes[2,j].step(mt.t, mt[col].map(mapping), where='post', label=label)
+        for op in ('confirmar', 'estado', 'reembolsar'):
+            col = f'pagos_cb_{op}'
+            if col in mt:
+                axes[2,j].step(mt.t, mt[col].map(mapping), where='post', label=f'TBK ({op})', ls='--', lw=.8)
         axes[2,j].set_yticks([0,1,2], ['CLOSED','HALF_OPEN','OPEN']); axes[2,j].legend(fontsize=8)
         for col, label in [('orq_admision_rech','Admisión Orq'), ('pagos_bulkhead_rech','Bulkhead Pagos')]:
             if col in mt:
                 axes[3,j].plot(mt.t, mt[col], label=label)
         axes[3,j].set_ylabel('Rechazos acumulados'); axes[3,j].legend(fontsize=8)
-        for col, label in [('orq_intentos_COBRAR_forward','Intentos Orq→Pagos'), ('pagos_tbk_intentos','Intentos Pagos→TBK')]:
+        for col, label in [('orq_intentos_COBRAR_forward','Intentos Orq→Pagos'),
+                           ('pagos_tbk_protegidos','Intentos protegidos Pagos→TBK'),
+                           ('pagos_tbk_fallas_simuladas','Fallas simuladas Pagos→TBK'),
+                           ('pagos_tbk_cliente_inicios','Inicios cliente Pagos→TBK')]:
             if col in mt:
                 axes[4,j].plot(mt.t, mt[col], label=label)
-        axes[4,j].set_ylabel('Intentos acumulados'); axes[4,j].legend(fontsize=8)
+        missing = [c for c in TBK_CONTADORES if c not in mt or mt[c].isna().any()]
+        if missing:
+            if not any(c in mt and mt[c].notna().any() for c in TBK_CONTADORES) and 'pagos_tbk_intentos' in mt:
+                axes[4,j].plot(mt.t, mt.pagos_tbk_intentos, label='Histórico Pagos→TBK (semántica ambigua)', ls=':')
+            axes[4,j].text(.02, .98, 'Telemetría de cliente desconocida o parcial',
+                           transform=axes[4,j].transAxes, va='top', fontsize=8)
+        axes[4,j].set_ylabel('Eventos acumulados'); axes[4,j].legend(fontsize=8)
         for state in ('COMPLETADA','COMPENSADA','ESPERANDO_PAGO','COMPENSACION_PENDIENTE'):
             axes[5,j].plot(mt.t, mt['orq_sagas_'+state], label=state)
         axes[5,j].set_ylabel('Sagas'); axes[5,j].legend(fontsize=7)
@@ -183,7 +218,7 @@ def fig_fases(t, ts):
     phases = list(dict.fromkeys(t.fase))
     fig, axes = plt.subplots(2, 2, figsize=(16,10))
     for ax, (col, label) in zip(axes.flat, [('p95_s','p95 POST (s)'), ('pct_fail_fast_orq','Fail-fast Orq comprobado (%)'),
-                                          ('intentos_a_pagos','Intentos reales Orq→Pagos'), ('sonda_orq_p95_s','p95 lectura Orq (s)')]):
+                                          ('intentos_a_pagos','Inicios Orq→Pagos'), ('sonda_orq_p95_s','p95 lectura Orq (s)')]):
         for j, variant in enumerate(VARIANTES):
             rows = t[t.variante == variant].set_index('fase').reindex(phases)
             ax.bar(np.arange(len(phases))+(j-.5)*.38, rows[col], .38, color=COLOR[variant], label=variant)
@@ -240,15 +275,20 @@ def resumen(d, t, por_rep, esc, ts):
         con, sin = slow.loc['con_patron'], slow.loc['sin_patron']
         lines += ['## Resultado principal: lentitud aislada de Pagos', '',
             f"Medianas de las repeticiones: {con.pct_fail_fast_orq:.1f}% de fail-fast comprobado con patrón; "
-            f"{con.intentos_a_pagos:.0f} intentos reales de crear pago frente a {sin.intentos_a_pagos:.0f} sin patrón. "
+            f"{con.intentos_a_pagos:.0f} inicios de solicitud de crear pago frente a {sin.intentos_a_pagos:.0f} sin patrón. "
             f"p50 de la solicitud {con.p50_s:.3f} s frente a {sin.p50_s:.3f} s; p95 {con.p95_s:.3f} s frente a {sin.p95_s:.3f} s. "
             f"Ocupación máxima muestreada de cobros en el orquestador: {con.orq_cobros_en_vuelo_max:.0f} frente a {sin.orq_cobros_en_vuelo_max:.0f}.", '',
             'El circuito reduce los intentos después del umbral; las primeras llamadas aún pagan el timeout. La p95 puede seguir cerca del timeout si esas llamadas superan el 5% de solicitudes. La carga de bucle cerrado ofrece más solicitudes cuando el rechazo es rápido, por lo que no se comparan volúmenes como si fueran una tasa fija de llegada.', '']
     fields = [c for c in ('variante','fase','workers','pagos_latencia_ms','tbk_latencia_ms','tbk_caido','saga_timeout_s','tbk_timeout_s','comprador') if c in d['fases']]
     lines += ['', '## Parámetros efectivamente ejecutados', '', _md(d['fases'][fields].drop_duplicates()), '',
         'Las variantes conservan los timeouts. Sin patrón usa umbral y capacidad elevados; conserva idempotencia, callbacks, reconciliación y timeouts.', '',
-        '## Comparación por fase', '', _md(t[[c for c in ('variante','fase','n_reps','peticiones','p50_s','p95_s','p95_s_min','p95_s_max','pct_429','pct_fail_fast_orq','intentos_a_pagos','compensaciones_orq','orq_cobros_en_vuelo_max','rechazos_admision_orq','intentos_a_tbk','sonda_orq_p95_s') if c in t]].round(3)), '',
+        '## Comparación por fase', '', _md(t[[c for c in ('variante','fase','n_reps','peticiones','p50_s','p95_s','p95_s_min','p95_s_max','pct_429','pct_fail_fast_orq','intentos_a_pagos','compensaciones_orq','orq_cobros_en_vuelo_max','rechazos_admision_orq','intentos_protegidos_tbk','fallas_simuladas_tbk','inicios_cliente_tbk','n_reps_inicios_cliente_tbk','sonda_orq_p95_s') if c in t]].round(3)), '',
         'Fail-fast del orquestador exige HTTP 503, motivo PAGOS_CIRCUITO_ABIERTO y latencia <200 ms. El porcentaje de respuestas rápidas incluye éxitos y otros rechazos: se conserva separado. Intentos y compensaciones son deltas entre límites de fase; ocupación es el máximo muestreado de cobros simultáneos, no CPU.', '',
+        'Los contadores distinguen intentos protegidos, fallas simuladas y llamadas iniciadas al cliente. Una llamada iniciada al cliente no demuestra recepción en la pasarela ni un cobro efectivo. El contador aumenta antes de ejecutar el cliente, aunque este falle o siga en curso. Una demora simulada menor que el timeout puede terminar en un inicio de cliente; solo una interrupción en la simulación aumenta fallas_simuladas_tbk.', '',
+        'El balance protegidos = simuladas + inicios de cliente se espera al terminar las operaciones normales; durante la simulación puede haber intentos admitidos aún sin desenlace. Los deltas de fases diferentes tampoco tienen que balancear si una llamada atraviesa un límite de fase.', '',
+        'Las columnas n_reps_* indican cobertura de telemetría. Si falta una frontera o una repetición, el conteo agregado permanece desconocido; no se reemplaza por cero ni por el contador histórico.', '',
+        '## Inicios de cliente Transbank por operación', '',
+        _md(t[[c for c in ('variante','fase','n_reps', *(f'inicios_cliente_tbk_{op}' for op in TBK_OPERACIONES)) if c in t]].round(3)), '',
         '## Apertura por frontera y recuperación', '']
     for phase in d['fases'].fase.unique():
         for variant in VARIANTES:
@@ -256,10 +296,10 @@ def resumen(d, t, por_rep, esc, ts):
             n = d['fases'].loc[(d['fases'].variante == variant) & (d['fases'].fase == phase), 'rep'].nunique()
             opened = metrics.loc[metrics.orq_cb_COBRAR == 'OPEN', 'rep'].nunique()
             inner = metrics.loc[metrics.pagos_cb == 'OPEN', 'rep'].nunique()
-            lines += [f'- {variant}, {phase}: Orquestador→Pagos (crear) abrió en {opened} de {n} repeticiones; Pagos→Transbank abrió en {inner} de {n}.']
+            lines += [f'- {variant}, {phase}: Orquestador→Pagos (crear) abrió en {opened} de {n} repeticiones; Pagos→Transbank (crear) abrió en {inner} de {n}.']
             if not opened and variant == 'con_patron':
                 lines += [f'  El circuito Orquestador→Pagos no abrió en esta fase; no se atribuye a él contención observada en la otra frontera.']
-    cols = [c for c in d['metricas'] if c.startswith('orq_cb_COBRAR_')]
+    cols = [c for c in d['metricas'] if c.startswith('orq_cb_COBRAR_') or c.startswith('pagos_cb_')]
     if cols:
         lines += ['', 'Estados observados por operación:', '', _md(d['metricas'].groupby(['variante','rep'])[cols].agg(lambda s: ','.join(sorted(s.dropna().unique()))).reset_index())]
     rq = d['requests']
@@ -280,9 +320,11 @@ def resumen(d, t, por_rep, esc, ts):
               '## Estado final y cierre de negocio', '']
     for _, row in d['estados'][d['estados'].momento == 'final'].iterrows():
         lines += [f"- {row.variante}, repetición {row.rep}: convergencia {row.convergencia_s} s (negativo = sin cierre); COMPLETADA {int(row.sagas_COMPLETADA)}, ESPERANDO_PAGO {int(row.sagas_ESPERANDO_PAGO)}, COMPENSADA {int(row.sagas_COMPENSADA)}, COMPENSACION_PENDIENTE {int(row.sagas_COMPENSACION_PENDIENTE)}; cupos huérfanos {int(row.cupos_huerfanos)}, cobros huérfanos {int(row.cobros_huerfanos)}."]
-    missing = [c for c in ('orq_intentos_COBRAR_forward','orq_admision_rech','pagos_tbk_intentos') if c not in d['metricas'] or d['metricas'][c].isna().any()]
+    missing = [c for c in ('orq_intentos_COBRAR_forward','orq_admision_rech', *TBK_CONTADORES)
+               if c not in d['metricas'] or d['metricas'][c].isna().any()]
     lines += ['', '## Límites y calidad de la medición', '',
         f'- Telemetría requerida ausente: {", ".join(missing) if missing else "ninguna"}. Valores ausentes se mantienen desconocidos; un contador que disminuye invalida el cálculo y detiene el informe.',
+        '- Los CSV históricos con solo pagos_tbk_intentos tienen semántica ambigua: esa serie puede incluir interrupciones anteriores al cliente. No se reinterpreta como tráfico real. Sin pagos_tbk_cliente_inicios explícito, los inicios quedan desconocidos. Las series y resúmenes históricos originales no se modifican.',
         '- Transbank y el comprador son simulados. En Pagos lento, un proxy experimental retrasa únicamente POST /v1/payments; reembolsos y consultas llegan al servicio real. El proxy registra incluso llamadas que continúan después del timeout. Ambas variantes usan el mismo proxy.',
         '- El comprador intenta aprobar los pagos aceptados. El drenaje exige cero ESPERANDO_PAGO, pagos pendientes y llamadas activas; si no se alcanza, el informe declara falta de cierre.',
         '- Procesos locales en una máquina, bases SQLite independientes, un proceso por servicio; no mide Kubernetes, PostgreSQL bajo carga, red distribuida ni Webpay real.',

@@ -9,12 +9,12 @@ from enum import Enum
 
 class TransbankUnavailable(Exception):
     """Transbank no respondió bien: timeout, 5xx, red, circuito abierto o bulkhead lleno.
-    El resultado de la operación es INCIERTO: pudo ejecutarse del lado de Transbank."""
+    El resultado es incierto salvo que seguro_no_enviado identifique un rechazo local."""
 
     def __init__(self, motivo: str = "no disponible", seguro_no_enviado: bool = False):
         super().__init__(motivo)
         self.motivo = motivo
-        # True si la llamada NUNCA salió (circuito abierto, bulkhead): no hubo efecto remoto.
+        # True si no se inició el cliente (circuito, bulkhead o falla artificial previa).
         self.seguro_no_enviado = seguro_no_enviado
 
 
@@ -81,8 +81,8 @@ class CircuitBreaker:
 
 
 class Faults:
-    """Fallas inducidas en la dependencia (PUT /internal/fault). latencia_ms mayor que el timeout
-    equivale a un timeout real; falla=True equivale a Transbank caído."""
+    """Simulación local antes del cliente (PUT /internal/fault).
+    Reproduce espera/caída para el circuito, sin acreditar tráfico hacia la pasarela."""
 
     def __init__(self):
         self.latencia_ms, self.falla = 0, False
@@ -120,10 +120,15 @@ class Guard:
         self.faults = faults or Faults()
         self.rejected = 0      # bulkhead lleno
         self.blocked = 0       # circuito abierto: la llamada ni siquiera se intentó
-        self.attempted = 0     # llamadas que pasaron las barreras y se intentaron contra Transbank
+        self.attempted = 0     # inicios del cliente; no prueba recepción por la pasarela
+        self.protected = 0     # admitidos por bulkhead y circuito, antes de la simulación
+        self.simulated = 0     # interrumpidos en la simulación, sin iniciar el cliente
         self.calls = {}
         self.seconds = {}
         self.blocked_by_operation = {name: 0 for name in self.OPERATIONS}
+        self.protected_by_operation = {name: 0 for name in self.OPERATIONS}
+        self.simulated_by_operation = {name: 0 for name in self.OPERATIONS}
+        self.started_by_operation = {name: 0 for name in self.OPERATIONS}
         self._lock = threading.Lock()
 
     def breaker_for(self, name: str) -> CircuitBreaker:
@@ -131,6 +136,9 @@ class Guard:
             if name not in self._breakers:
                 self._breakers[name] = CircuitBreaker(self._threshold, self._recovery)
                 self.blocked_by_operation[name] = 0
+                self.protected_by_operation[name] = 0
+                self.simulated_by_operation[name] = 0
+                self.started_by_operation[name] = 0
             return self._breakers[name]
 
     @property
@@ -147,7 +155,11 @@ class Guard:
         with self._lock:
             breakers = tuple(self._breakers.items())
             snapshot = dict(rejected=self.rejected, blocked=self.blocked, attempted=self.attempted,
+                            protected=self.protected, simulated=self.simulated,
                             blocked_by_operation=dict(self.blocked_by_operation),
+                            protected_by_operation=dict(self.protected_by_operation),
+                            simulated_by_operation=dict(self.simulated_by_operation),
+                            started_by_operation=dict(self.started_by_operation),
                             calls=dict(self.calls), seconds=dict(self.seconds))
         snapshot["circuits"] = {name: breaker.state.value for name, breaker in breakers}
         return snapshot
@@ -166,9 +178,20 @@ class Guard:
                     self.blocked_by_operation[name] += 1
                 raise TransbankUnavailable("circuito abierto", seguro_no_enviado=True)
             with self._lock:
-                self.attempted += 1
+                self.protected += 1
+                self.protected_by_operation[name] += 1
             try:
                 self.faults.apply(timeout)
+            except Exception as exc:
+                with self._lock:
+                    self.simulated += 1
+                    self.simulated_by_operation[name] += 1
+                breaker.record_failure()
+                raise TransbankUnavailable(type(exc).__name__, seguro_no_enviado=True) from exc
+            with self._lock:
+                self.attempted += 1
+                self.started_by_operation[name] += 1
+            try:
                 result = fn(*args)
             except TransbankRejected:
                 breaker.record_success()
