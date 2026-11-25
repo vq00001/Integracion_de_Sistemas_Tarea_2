@@ -16,7 +16,8 @@ En E3 una carga de bucle cerrado de POST /v1/matriculas atraviesa las fases y, e
 resto del sistema": GET /v1/sagas/{id} (mismo proceso que la saga: ahí se ve la cascada), GET
 /v1/health de Pagos (mismo proceso que la llamada lenta a Transbank: ahí se ve si el bulkhead protege sus hilos) y
 GET /v1/enrollments en Inscripción (otro servicio: ahí se ve el aislamiento). Un muestreador lee /metrics
-cada 0,5 s (estado del circuito, rechazos del bulkhead, intentos reales hacia Transbank, sagas por estado).
+cada 0,5 s (circuitos, rechazos del bulkhead, admisiones protegidas, fallas simuladas,
+llamadas iniciadas al cliente de Transbank y sagas por estado; un inicio no acredita recepción remota).
 
 Uso (desde la raíz del repositorio):
     python experiment/scripts/saga_fallas.py                # completo (~5 min)
@@ -331,6 +332,12 @@ class Stack:
 
 # ------------------------------------------------------------------------------------------ métricas (/metrics)
 _LINEA = re.compile(r"^(\w+)(?:\{([^}]*)\})?\s+(-?[0-9.eE+-]+)$")
+TBK_OPERACIONES = ("crear", "confirmar", "estado", "reembolsar")
+TBK_METRICAS = {
+    "pagos_tbk_protegidos": "transbank_intentos_protegidos_total",
+    "pagos_tbk_fallas_simuladas": "transbank_fallas_simuladas_total",
+    "pagos_tbk_cliente_inicios": "transbank_cliente_llamadas_iniciadas_total",
+}
 
 
 def parsear_metricas(texto: str) -> list[tuple[str, dict, float]]:
@@ -351,8 +358,19 @@ def _circuito(ms, dep):
     return next((e["estado"] for n, e, v in ms if n == "circuito_estado" and e.get("dependencia") == dep and v == 1), "?")
 
 
+def _contador_operacion(ms, family, operation):
+    values = [v for n, e, v in ms if n == family and e.get("operacion") == operation]
+    if len(values) != 1 or not math.isfinite(values[0]) or values[0] < 0:
+        return None
+    return values[0]
+
+
 def muestra_metricas(stack: Stack) -> dict:
-    fila = {}
+    # Esquema estable incluso si la primera muestra falla. Ausencia no significa cero.
+    fila = {f"pagos_cb_{op}": "?" for op in TBK_OPERACIONES}
+    for column in TBK_METRICAS:
+        fila[column] = None
+        fila.update({f"{column}_{op}": None for op in TBK_OPERACIONES})
     try:
         response = requests.get(f"{stack.orq}/metrics", timeout=2)
         response.raise_for_status()
@@ -382,6 +400,14 @@ def muestra_metricas(stack: Stack) -> dict:
         fila["pagos_bulkhead_rech"] = _valor(p, "bulkhead_rechazos_total", default=None, dependencia="TRANSBANK")
         fila["pagos_circuito_rech"] = _valor(p, "circuito_rechazos_total", default=None, dependencia="TRANSBANK")
         fila["pagos_tbk_intentos"] = _valor(p, "transbank_intentos_total", default=None)
+        for column, family in TBK_METRICAS.items():
+            values = [_contador_operacion(p, family, op) for op in TBK_OPERACIONES]
+            fila.update({f"{column}_{op}": value for op, value in zip(TBK_OPERACIONES, values)})
+            fila[column] = sum(values) if all(value is not None for value in values) else None
+        for op in TBK_OPERACIONES:
+            states = [e["estado"] for n, e, v in p if n == "transbank_circuito_estado"
+                      and e.get("operacion") == op and v == 1]
+            fila[f"pagos_cb_{op}"] = states[0] if len(states) == 1 else "?"
     except requests.RequestException:
         fila["pagos_ok"] = 0
     return fila
@@ -649,6 +675,8 @@ def main():
         git_head=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
         git_status=subprocess.check_output(['git','status','--short'], cwd=ROOT, text=True),
         python=sys.version, argv=sys.argv[1:], patrones=PATRONES,
+        metricas_transbank=dict(version=2, columnas=TBK_METRICAS,
+                               semantica="Inicios de cliente no demuestran recepción en la pasarela"),
         fases=[vars(f) for f in plan(args.rapido)], timeout_saga_s=2, timeout_tbk_s=1.5)
     manifest_path = RAW/f'{prefijo}_manifest.json'
     previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}

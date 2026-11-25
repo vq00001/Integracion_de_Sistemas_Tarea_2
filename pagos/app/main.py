@@ -188,7 +188,25 @@ def create_app(settings: Settings | None = None, webpay: Webpay | None = None, n
             lines.append(f'transbank_circuito_rechazos_total{{operacion="{op}"}} {snapshot["blocked_by_operation"][op]}')
         lines.append(f'bulkhead_rechazos_total{{dependencia="TRANSBANK"}} {snapshot["rejected"]}')
         lines.append(f'circuito_rechazos_total{{dependencia="TRANSBANK"}} {snapshot["blocked"]}')
+        lines += [
+            '# HELP transbank_intentos_protegidos_total Admisiones tras bulkhead y circuito, antes de simular fallas.',
+            '# TYPE transbank_intentos_protegidos_total counter',
+            '# HELP transbank_fallas_simuladas_total Interrupciones en simulacion antes de iniciar el cliente.',
+            '# TYPE transbank_fallas_simuladas_total counter',
+            '# HELP transbank_cliente_llamadas_iniciadas_total Inicios del callable cliente; no acredita recepcion remota.',
+            '# TYPE transbank_cliente_llamadas_iniciadas_total counter',
+        ]
+        for op in snapshot["circuits"]:
+            for family, key in (
+                ("transbank_intentos_protegidos_total", "protected_by_operation"),
+                ("transbank_fallas_simuladas_total", "simulated_by_operation"),
+                ("transbank_cliente_llamadas_iniciadas_total", "started_by_operation"),
+            ):
+                lines.append(f'{family}{{operacion="{op}"}} {snapshot[key][op]}')
+        lines.append('# HELP transbank_intentos_total Alias de inicios del cliente desde H13; historicos anteriores eran ambiguos.')
         lines.append(f'transbank_intentos_total {snapshot["attempted"]}')
+        lines.append('# HELP transbank_llamadas_total Operaciones finalizadas en Guard, incluidos rechazos locales; no envios remotos.')
+        lines.append('# HELP transbank_duracion_seconds_sum Tiempo en Guard, incluida simulacion; no latencia de red aislada.')
         for op, n in snapshot["calls"].items():
             lines.append(f'transbank_llamadas_total{{operacion="{op}"}} {n}')
             lines.append(f'transbank_duracion_seconds_sum{{operacion="{op}"}} {snapshot["seconds"].get(op, 0.0)}')

@@ -1,4 +1,4 @@
-"""H13 RED: distinguir admisión protegida, falla simulada e inicio del cliente.
+"""H13: distinguir admisión protegida, falla simulada e inicio del cliente.
 
 El contador histórico attempted/intentos no debe anticipar la ejecución del cliente.
 Las métricas explícitas se exportan por operación; el muestreo conserva tanto el
@@ -55,10 +55,14 @@ def env_factory(monkeypatch):
 def test_h13_falla_simulada_antes_del_cliente_no_cuenta_como_intento_iniciado(env_factory, operacion, falla):
     env = env_factory()
     env.guard.faults.set(falla=falla == "caida", latencia_ms=3000 if falla == "timeout" else 0)
-    with pytest.raises(TransbankUnavailable):
+    with pytest.raises(TransbankUnavailable) as failure:
         _llamar(env, operacion)
+    assert failure.value.seguro_no_enviado
     assert env.client.calls[operacion] == 0
     assert env.guard.attempted == 0, "Se contó un inicio de cliente aunque Faults.apply impidió ejecutarlo"
+    snapshot = env.guard.metrics_snapshot()
+    assert snapshot["protected"] == snapshot["simulated"] == 1
+    assert snapshot["protected_by_operation"][operacion] == snapshot["simulated_by_operation"][operacion] == 1
 
 
 def test_h13_circuito_abierto_no_agrega_intentos_a_fallas_que_nunca_llegaron_al_cliente(env_factory):
@@ -72,6 +76,7 @@ def test_h13_circuito_abierto_no_agrega_intentos_a_fallas_que_nunca_llegaron_al_
     assert failure.value.seguro_no_enviado and env.guard.blocked == 1
     assert env.client.calls["crear"] == 0
     assert env.guard.attempted == 0, "El contador acumuló cinco fallas sintéticas como llamadas al cliente"
+    assert env.guard.protected == env.guard.simulated == 5
 
 
 @pytest.mark.parametrize("resultado", ["normal", "timeout", "rechazo"])
@@ -104,6 +109,8 @@ def test_h13_esperar_en_la_inyeccion_no_anticipa_el_inicio_del_cliente(env_facto
             assert entrada.wait(timeout=5)
             assert env.client.calls["crear"] == 0
             assert env.guard.attempted == 0, "Se publicó un inicio antes de entrar al cliente"
+            snapshot = env.guard.metrics_snapshot()
+            assert snapshot["protected"] == 1 and snapshot["simulated"] == 0
         finally:
             liberar.set()
         assert futuro.result(timeout=5)["token"] == "token-h11"
@@ -143,6 +150,28 @@ def test_h13_concurrencia_conserva_la_cantidad_de_inicios_reales_del_cliente(env
         list(executor.map(lambda _: solicitud(), range(8)))
     assert env.client.calls["crear"] == (0 if simulada else 8)
     assert env.guard.attempted == env.client.calls["crear"], "La concurrencia mezcló simulaciones con inicios de cliente"
+    snapshot = env.guard.metrics_snapshot()
+    assert snapshot["protected"] == snapshot["simulated"] + snapshot["attempted"] == 8
+    for total, by_operation in (("protected", "protected_by_operation"), ("simulated", "simulated_by_operation"),
+                                ("attempted", "started_by_operation")):
+        assert snapshot[total] == sum(snapshot[by_operation].values())
+
+
+def test_h13_rechazo_por_bulkhead_no_se_cuenta_como_admision_ni_inicio(env_factory):
+    env = env_factory()
+    # Ocupar todos los permisos explícitamente evita depender del planificador.
+    for _ in range(8):
+        assert env.guard.semaphore.acquire(blocking=False)
+    try:
+        with pytest.raises(TransbankUnavailable) as failure:
+            _llamar(env, "crear")
+        assert failure.value.seguro_no_enviado and env.guard.rejected == 1
+        snapshot = env.guard.metrics_snapshot()
+        assert snapshot["protected"] == snapshot["simulated"] == snapshot["attempted"] == 0
+        assert env.client.calls["crear"] == 0
+    finally:
+        for _ in range(8):
+            env.guard.semaphore.release()
 
 
 @pytest.mark.parametrize("perfil", ["normal", "caida_simulada", "timeout_simulado", "latencia_corta", "http_503"])
@@ -178,6 +207,24 @@ def test_h13_exportador_distingue_protegidos_simulaciones_e_inicios_por_operacio
         series = {labels["operacion"]: value for name, labels, value in metrics if name == family}
         assert set(series) == set(OPS), f"Falta telemetría explícita de {family} para todas las operaciones"
         assert series == {op: expected[kind] if op == "crear" else 0 for op in OPS}
+
+
+def test_h13_falla_anterior_al_cliente_permite_reintentar_la_misma_clave_sin_duplicar(pagos):
+    guard = pagos.service.webpay.guard
+    key = "h13-reintento-conocido:COBRAR"
+    guard.faults.set(falla=True)
+    response = _post(pagos.client, "/v1/payments", key, PAYLOAD)
+    assert response.status_code == 503 and response.headers.get("Retry-After")
+    assert guard.attempted == pagos.fake.calls["create"] == 0
+    guard.faults.set(falla=False)
+    response = _post(pagos.client, "/v1/payments", key, PAYLOAD)
+    # La fila local ya existía: H9 continúa su creación externa con HTTP 200.
+    assert response.status_code == 200 and response.json()["estado"] == "PENDIENTE", response.text
+    assert response.json()["redirect_url"]
+    replay = _post(pagos.client, "/v1/payments", key, PAYLOAD)
+    assert replay.status_code == 200 and replay.json()["payment_id"] == response.json()["payment_id"]
+    assert guard.protected == 2 and guard.simulated == 1
+    assert guard.attempted == pagos.fake.calls["create"] == len(pagos.fake.tx) == 1
 
 
 def _respuesta(text, status=200):
@@ -229,6 +276,16 @@ def test_h13_metrica_parcial_no_se_completa_con_ceros_ni_con_el_contador_legacy(
     assert row.get(RAW["cliente"]) is None
     assert row.get(RAW["cliente"] + "_reembolsar") is None
     assert row.get(RAW["cliente"] + "_crear") == 2, "Se descartó telemetría válida o se sustituyó por el alias legacy"
+
+
+@pytest.mark.parametrize("invalido", ["duplicado", "-1", "NaN", "+Inf", "1e309"])
+def test_h13_telemetria_invalida_permanece_desconocida(exp, monkeypatch, invalido):
+    valores = {kind: (0, 0, 0, 0) for kind in METRICAS}
+    original = f'{METRICAS["cliente"]}{{operacion="crear"}} 0'
+    reemplazo = original + "\n" + original if invalido == "duplicado" else original[:-1] + invalido
+    row = _muestrear(exp, monkeypatch, _telemetria(valores).replace(original, reemplazo))
+    assert row[RAW["cliente"]] is None and row[RAW["cliente"] + "_crear"] is None
+    assert row[RAW["cliente"] + "_estado"] == 0
 
 
 def test_h13_muestreo_conserva_los_cuatro_circuitos_de_h11(exp, monkeypatch):

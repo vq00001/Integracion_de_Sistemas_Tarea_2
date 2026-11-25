@@ -56,9 +56,10 @@ por operación a esa misma familia; se publican en `transbank_circuito_estado`.
 de todos los circuitos. Es igual a la suma de los nuevos contadores por operación.
 El contador de rechazos del bulkhead conserva su significado y familia anteriores.
 
-La precisión del contador de intentos frente a fallas artificiales corresponde a
-H13: su semántica no se cambia aquí. Tampoco se modifican los CSV ni los informes
-históricos. La evidencia integrada se regenerará al reunir los frentes.
+H13 separa admisiones, fallas artificiales e inicios del cliente y muestrea los
+cuatro circuitos; sus fronteras y la compatibilidad histórica se describen en
+[Métricas de Transbank](h13-metricas-transbank.md). Los CSV e informes históricos
+se conservan. La evidencia integrada se regenerará al reunir los frentes.
 
 ## Validación
 

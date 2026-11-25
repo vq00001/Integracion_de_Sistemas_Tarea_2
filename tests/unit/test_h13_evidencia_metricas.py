@@ -1,4 +1,4 @@
-"""H13 RED: tablas, figuras e interpretación usan la semántica de cada contador.
+"""H13: tablas, figuras e interpretación usan la semántica de cada contador.
 
 Todos los datos son sintéticos y toda salida vive en tmp_path. Los contadores
 legacy son deliberadamente distintos para detectar un fallback engañoso.
@@ -92,6 +92,23 @@ def test_h13_frontera_sin_muestra_de_cliente_permanece_desconocida(graf):
     row = per[(per.variante == "con_patron") & (per.rep == 1) & (per.fase == "caida")].iloc[0]
     assert pd.isna(row[TABLE["cliente"]]) and pd.isna(row["intentos_a_tbk"])
     assert row[TABLE["protegidos"]] == 10 and row[TABLE["simuladas"]] == 6
+    agregado = graf.tabla_agregada(per)
+    combined = agregado[(agregado.variante == "con_patron") & (agregado.fase == "caida")].iloc[0]
+    assert combined["n_reps"] == 3 and combined["n_reps_inicios_cliente_tbk"] == 2
+    assert pd.isna(combined[TABLE["cliente"]]), "Una mediana parcial ocultó la repetición sin telemetría"
+
+
+def test_h13_ultima_muestra_ausente_no_se_sustituye_por_una_lectura_anterior(graf):
+    data = _datos(puntos=False)
+    mt = data["metricas"]
+    indices = mt[(mt.variante == "con_patron") & (mt.rep == 1) & (mt.fase == "caida")].index
+    # El fixture duplica el instante de frontera en el inicio de la fase siguiente.
+    # Ambas lecturas de ese instante deben faltar; una segunda lectura válida sí sirve.
+    frontera = mt.loc[indices[-1], "t"]
+    mt.loc[(mt.variante == "con_patron") & (mt.rep == 1) & (mt.t == frontera), RAW["cliente"]] = np.nan
+    per = graf.tabla_por_rep(data)
+    row = per[(per.variante == "con_patron") & (per.rep == 1) & (per.fase == "caida")].iloc[0]
+    assert pd.isna(row[TABLE["cliente"]])
 
 
 def test_h13_informe_explica_simulaciones_e_inicios_sin_afirmar_recepcion_en_la_pasarela(graf):

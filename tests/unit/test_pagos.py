@@ -236,16 +236,21 @@ def test_transbank_lento_o_caido_abre_el_circuito_y_responde_rapido(ctx):
     put = lambda **b: ctx.c.put("/internal/fault", json=b, headers={"X-Internal-Key": INTERNAL})
     assert put(latencia_ms=2000).json() == {"latencia_ms": 2000, "falla": False}  # > timeout (0,3 s)
     codigos = [crear(ctx)[1].status_code for _ in range(3)]
-    assert codigos == [502, 502, 502]                       # timeouts: resultado incierto
+    assert codigos == [503, 503, 503]                       # simulación anterior al cliente: no enviado
     inicio = time.monotonic()
     r = crear(ctx)[1]
     assert r.status_code == 503 and r.headers["Retry-After"] and time.monotonic() - inicio < 0.2  # fail-fast
     assert 'circuito_estado{dependencia="TRANSBANK",estado="OPEN"} 1' in ctx.c.get("/metrics").text
     metricas = ctx.c.get("/metrics").text
-    assert "circuito_rechazos_total{dependencia=\"TRANSBANK\"} 1" in metricas and "transbank_intentos_total 3" in metricas
+    assert "circuito_rechazos_total{dependencia=\"TRANSBANK\"} 1" in metricas
+    assert "transbank_intentos_total 0" in metricas and ctx.fake.calls["create"] == 0
+    assert 'transbank_intentos_protegidos_total{operacion="crear"} 3' in metricas
+    assert 'transbank_fallas_simuladas_total{operacion="crear"} 3' in metricas
+    assert 'transbank_cliente_llamadas_iniciadas_total{operacion="crear"} 0' in metricas
     put(latencia_ms=0, falla=False)
     time.sleep(0.4)                                          # recuperación: HALF_OPEN deja pasar una sonda
     assert crear(ctx)[1].status_code == 201
+    assert ctx.fake.calls["create"] == 1
     assert 'estado="CLOSED"} 1' in ctx.c.get("/metrics").text
 
 
