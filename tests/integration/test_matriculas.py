@@ -4,6 +4,7 @@ import uuid
 import pytest
 
 from tests.conftest import CURSO_CON_CUPO, rut_valido
+from tests.support.inscripciones import compensar_inscripcion, inscribir
 
 
 # ---------- T2: versionado, semántica HTTP, errores JSON ----------
@@ -89,67 +90,71 @@ def test_rut_con_puntos_se_guarda_normalizado(api):
 # ---------- Matrículas ----------
 
 def test_matricula_valida(api, estudiante):
-    """Valida el flujo normal: crea una matrícula activa y luego la elimina limpiamente."""
-    r = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO})
+    """Registra una inscripción activa y después la compensa por la ruta interna."""
+    r = inscribir(api, json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 201, r.text
     m = r.json()
     assert m["estado"] == "CONFIRMADA"
     assert api.get(f"/v1/enrollments/{m['id']}").status_code == 200
-    api.post(f"/v1/enrollments/{m['id']}/revert")  # limpieza local
+    compensar_inscripcion(r)
 
 
 def test_inscripcion_no_vuelve_a_reservar_un_curso_lleno(api, estudiante, curso_lleno):
-    r = api.inscribir(json={'student_id':estudiante['id'],'curso_id':curso_lleno})
+    r = inscribir(api, json={'student_id':estudiante['id'],'curso_id':curso_lleno})
     assert r.status_code == 201
-    api.post(f"/v1/enrollments/{r.json()['id']}/revert")
+    compensar_inscripcion(r)
 
 
 def test_inscripcion_delega_validacion_del_curso_al_orquestador(api, estudiante):
-    r = api.inscribir(json={'student_id':estudiante['id'],'curso_id':999999})
+    r = inscribir(api, json={'student_id':estudiante['id'],'curso_id':999999})
     assert r.status_code == 201
-    api.post(f"/v1/enrollments/{r.json()['id']}/revert")
+    compensar_inscripcion(r)
 
 
 def test_matricula_estudiante_inexistente_da_404(api):
     """Verifica que no se permite matricular a un estudiante que no existe."""
-    r = api.inscribir(json={"student_id": "no-existe", "curso_id": CURSO_CON_CUPO})
+    r = inscribir(api, json={"student_id": "no-existe", "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 404
 
 
 def test_matricula_duplicada_da_409(api, estudiante):
     """Comprueba que intentar matricularse dos veces al mismo curso devuelve conflicto."""
     body = {"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}
-    primera = api.inscribir(json=body)
+    primera = inscribir(api, json=body)
     assert primera.status_code == 201
-    segunda = api.inscribir(json=body)
+    segunda = inscribir(api, json=body)
     assert segunda.status_code == 409
-    api.post(f"/v1/enrollments/{primera.json()['id']}/revert")
+    compensar_inscripcion(primera)
 
 
-def test_revertir_matricula(api, estudiante):
-    """Prueba que una matrícula puede revertirse y pasar a estado ANULADA."""
-    m = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}).json()
-    assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 200
-    despues = api.get(f"/v1/enrollments/{m['id']}")
-    assert despues.status_code == 200 and despues.json()["estado"] == "ANULADA"
+def test_baja_publica_rechazada_conserva_inscripcion(api, estudiante):
+    alta = inscribir(api, json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO})
+    assert alta.status_code == 201
+    try:
+        m = alta.json()
+        assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 403
+        despues = api.get(f"/v1/enrollments/{m['id']}")
+        assert despues.status_code == 200 and despues.json() == m
+    finally:
+        compensar_inscripcion(alta)
 
 
-def test_revertir_inexistente_da_404(api):
-    """Confirma que intentar revertir una matrícula inexistente responde 404."""
-    assert api.post("/v1/enrollments/no-existe/revert").status_code == 404
+def test_baja_publica_no_revela_si_la_inscripcion_existe(api):
+    assert api.post("/v1/enrollments/no-existe/revert").status_code == 403
 
 
 # ---------- Integración REST <-> gRPC: el cupo realmente se mueve ----------
 
 @pytest.mark.grpc
-def test_inscribir_y_dar_baja_no_modifica_cupos(api, estudiante, cupos_stub):
+def test_inscribir_y_compensar_no_modifica_cupos(api, estudiante, cupos_stub):
     pb, stub = cupos_stub.pb2, cupos_stub.stub
     libres = lambda: stub.obtenerCupo(pb.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
     before = libres()
-    m = api.inscribir(json={'student_id':estudiante['id'],'curso_id':CURSO_CON_CUPO}).json()
+    alta = inscribir(api, json={'student_id':estudiante['id'],'curso_id':CURSO_CON_CUPO})
+    assert alta.status_code == 201
     assert libres() == before
     for _ in range(2):
-        assert api.post(f"/v1/enrollments/{m['id']}/revert").status_code == 200
+        assert compensar_inscripcion(alta).status_code == 200
     assert libres() == before
 
 

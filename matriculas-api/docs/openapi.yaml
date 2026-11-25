@@ -6,8 +6,10 @@ info:
     La reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción
     ACTIVA.
 
-    La misma Idempotency-Key devuelve la inscripción existente; repetir la baja devuelve
-    200.
+    La misma Idempotency-Key devuelve la inscripción existente. La baja pública está
+    deshabilitada;
+
+    las compensaciones pertenecen a la operación interna autenticada del orquestador.
 
     '
   version: 2.0.0
@@ -834,8 +836,13 @@ paths:
     post:
       tags:
       - Matrículas
-      summary: Dar de baja una inscripción (idempotente)
+      summary: Baja pública deshabilitada
+      description: 'La baja directa está deshabilitada para conservar la coherencia
+        de la Saga: no modifica la inscripción, la reserva ni el cobro. Las compensaciones
+        las ejecuta el orquestador mediante su operación interna autenticada. No existe
+        una operación pública de cancelación global.'
       operationId: revertir_matricula_v1_enrollments__enrollment_id__revert_post
+      deprecated: true
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -855,24 +862,18 @@ paths:
           - type: 'null'
           title: X-Api-Key
       responses:
-        '200':
-          description: Successful Response
+        '403':
+          description: Baja pública deshabilitada; sin efectos laterales
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EnrollmentOut'
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
           description: Unauthorized
-        '404':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-          description: Not Found
         '429':
           content:
             application/json:

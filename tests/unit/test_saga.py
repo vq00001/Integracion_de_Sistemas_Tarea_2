@@ -145,7 +145,8 @@ def test_client_clasifica_negocio_sin_abrir_breaker_y_bulkhead_aislado(m):
     other.semaphore.release(); client.semaphore.release()
 
 
-def test_inscripcion_idempotencia_bajas_y_reinscripcion(cliente,m,monkeypatch):
+def test_inscripcion_idempotencia_compensaciones_y_reinscripcion(cliente,m,monkeypatch):
+    monkeypatch.setenv('INTERNAL_KEY', 'h7-test-internal-key')
     est,_ = _alumno(cliente)
     body = dict(student_id=est['id'],curso_id=1)
     h = {**_admin(),'Idempotency-Key':str(uuid.uuid4())}
@@ -160,9 +161,11 @@ def test_inscripcion_idempotencia_bajas_y_reinscripcion(cliente,m,monkeypatch):
     spec = cliente.get('/openapi.json').json()
     validar(spec,'post','/v1/enrollments',first)
     for _ in range(2):
-        baja=cliente.post(f"/v1/enrollments/{first.json()['id']}/revert",headers=_admin())
-        assert baja.status_code == 200
-        validar(spec,'post','/v1/enrollments/{enrollment_id}/revert',baja)
+        baja=cliente.post('/internal/enrollments/cancel',json=body,
+                          headers={'X-Internal-Key':'h7-test-internal-key',
+                                   'Idempotency-Key':h['Idempotency-Key']})
+        assert baja.status_code == 200 and baja.json()['estado'] == 'ANULADA'
+        assert baja.json()['id'] == first.json()['id']
     replay = cliente.post('/v1/enrollments',json=body,headers=h)
     assert replay.json()['id'] == first.json()['id'] and replay.json()['estado'] == 'ANULADA'
     h['Idempotency-Key'] = str(uuid.uuid4())

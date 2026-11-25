@@ -1,6 +1,6 @@
 """T6 (ampliado): API keys por estudiante con permisos acotados y clave admin.
 
-- La clave admin (la de `api`) puede todo.
+- La clave admin administra los recursos; la baja pública permanece deshabilitada.
 - La clave de un estudiante se emite a demanda (solo admin), es una por estudiante y solo
   permite operar sobre los datos de ese estudiante.
 """
@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from tests.conftest import CURSO_CON_CUPO, Api, BASE_URL, rut_valido
+from tests.support.inscripciones import compensar_inscripcion, inscribir
 
 
 def _crear_estudiante(api) -> dict:
@@ -117,19 +118,21 @@ def test_estudiante_no_lista_ni_crea_estudiantes(alumno_a):
 
 # ---------- Alcance de la clave de estudiante: matrículas ----------
 
-def test_estudiante_se_matricula_y_revierte_solo_a_si_mismo(alumno_a):
+def test_estudiante_consulta_su_matricula_pero_no_puede_anularla(alumno_a):
     est, cli = alumno_a
-    r = cli.inscribir(json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
+    r = inscribir(cli, json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 201, r.text
     eid = r.json()["id"]
     assert cli.get(f"/v1/enrollments/{eid}").status_code == 200
-    assert cli.post(f"/v1/enrollments/{eid}/revert").status_code == 200
+    assert cli.post(f"/v1/enrollments/{eid}/revert").status_code == 403
+    assert cli.get(f"/v1/enrollments/{eid}").json()["estado"] == "CONFIRMADA"
+    compensar_inscripcion(r)
 
 
 def test_estudiante_no_matricula_a_otro(alumno_a, alumno_b):
     _, cli_a = alumno_a
     est_b, _ = alumno_b
-    r = cli_a.inscribir(json={"student_id": est_b["id"], "curso_id": CURSO_CON_CUPO})
+    r = inscribir(cli_a, json={"student_id": est_b["id"], "curso_id": CURSO_CON_CUPO})
     assert r.status_code == 403
     # y no quedó nada creado a nombre de B
     assert not [e for e in _listar(est_b)]
@@ -143,22 +146,24 @@ def _listar(est):
 def test_matricula_ajena_se_trata_como_inexistente(alumno_a, alumno_b):
     est_a, cli_a = alumno_a
     _, cli_b = alumno_b
-    eid = cli_a.inscribir(json={"student_id": est_a["id"], "curso_id": CURSO_CON_CUPO}).json()["id"]
+    alta = inscribir(cli_a, json={"student_id": est_a["id"], "curso_id": CURSO_CON_CUPO})
+    assert alta.status_code == 201
+    eid = alta.json()["id"]
     assert cli_b.get(f"/v1/enrollments/{eid}").status_code == 404
-    assert cli_b.post(f"/v1/enrollments/{eid}/revert").status_code == 404
+    assert cli_b.post(f"/v1/enrollments/{eid}/revert").status_code == 403
     # la matrícula sigue confirmada (B no pudo revertirla)
     assert cli_a.get(f"/v1/enrollments/{eid}").json()["estado"] == "CONFIRMADA"
-    cli_a.post(f"/v1/enrollments/{eid}/revert")  # limpieza: devuelve el cupo
+    compensar_inscripcion(alta)
 
 
 def test_listado_de_matriculas_se_acota_al_propio_estudiante(api, alumno_a, alumno_b):
     est_a, cli_a = alumno_a
     est_b, cli_b = alumno_b
-    ids = []
+    altas = []
     for est, cli in ((est_a, cli_a), (est_b, cli_b)):
-        r = cli.inscribir(json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
+        r = inscribir(cli, json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
         assert r.status_code == 201
-        ids.append(r.json()["id"])
+        altas.append(r)
     try:
         propios = cli_a.get("/v1/enrollments").json()
         assert {e["student_id"] for e in propios["items"]} == {est_a["id"]}
@@ -167,8 +172,8 @@ def test_listado_de_matriculas_se_acota_al_propio_estudiante(api, alumno_a, alum
         # el admin sigue viendo todo
         assert api.get("/v1/enrollments", params={"student_id": est_b["id"]}).json()["total"] >= 1
     finally:
-        for cli, eid in zip((cli_a, cli_b), ids):
-            cli.post(f"/v1/enrollments/{eid}/revert")
+        for alta in altas:
+            compensar_inscripcion(alta)
 
 
 # ---------- La clave admin sigue funcionando ----------

@@ -159,11 +159,18 @@ def test_los_aciertos_no_consumen_el_limite_de_intentos_fallidos(cliente, m, mon
 def test_un_estudiante_no_puede_escribir_en_bucle_pero_el_admin_si(cliente, m, monkeypatch):
     est, clave = _alumno(cliente)
     monkeypatch.setattr(m.security._limitador_escrituras, "limite", 3)
-    h = {"X-API-Key": clave["api_key"]}
-    codigos = [cliente.post(f"/v1/enrollments/{uuid.uuid4()}/revert", headers=h).status_code for _ in range(5)]
-    assert codigos == [404, 404, 404, 429, 429], codigos
-    admin = [cliente.post(f"/v1/enrollments/{uuid.uuid4()}/revert", headers=_admin()).status_code for _ in range(6)]
-    assert admin == [404] * 6
+    h = {**_admin(), "X-API-Key": clave["api_key"]}
+    # La baja pública ya no escribe. Se prueba el límite en el alta interna,
+    # usando la credencial de escritor exclusivamente para preparar este caso.
+    codigos = [cliente.post('/v1/enrollments', headers=h,
+                          json={'student_id': est['id'], 'curso_id': 100 + i}).status_code
+               for i in range(5)]
+    assert codigos == [201, 201, 201, 429, 429], codigos
+    admin = [cliente.post('/v1/enrollments', headers=_admin(),
+                        json={'student_id': est['id'], 'curso_id': 200 + i}).status_code
+             for i in range(6)]
+    assert admin == [201] * 6
+
 
 
 def test_el_limitador_de_ventana_expira():
