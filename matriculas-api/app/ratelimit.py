@@ -7,10 +7,10 @@ Se usa para dos cosas (ver security.py y routers/enrollments.py):
 Limitaciones asumidas (declaradas en docs/adr/D5):
   - El estado vive en el proceso: con varias réplicas el límite efectivo es N × límite
     (para un límite global habría que usar Redis o el balanceador).
-  - La IP es la del socket (`request.client`). Detrás de un proxy hay que configurar el proxy
-    (uvicorn --proxy-headers --forwarded-allow-ips) para que sea la del cliente real; sin eso
-    todos los clientes compartirían una IP. No se confía en X-Forwarded-For por defecto
-    porque cualquier cliente podría falsificarlo para evadir el límite.
+  - La identidad de red parte de la IP del socket (`request.client`). Si la solicitud llega
+    desde el Gateway, security.py usa la IP que el Gateway obtuvo del socket y firmó con el
+    secreto compartido. No se confía en X-Forwarded-For ni en cabeceras de identidad enviadas
+    sin firma válida por un cliente.
 """
 from __future__ import annotations
 

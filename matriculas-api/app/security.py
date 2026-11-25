@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import secrets
@@ -150,7 +151,21 @@ def _no_autenticado(detalle: str, esquema: str = "ApiKey") -> HTTPException:
 
 
 def _ip(request: Request) -> str:
-    return request.client.host if request.client else "desconocido"
+    socket_ip = request.client.host if request.client else "desconocido"
+    client_ip = request.headers.get("X-Gateway-Client-IP", "")
+    signature = request.headers.get("X-Gateway-Client-IP-Signature", "")
+    if not client_ip or not signature or len(settings.jwt_secret) < 32:
+        return socket_ip
+    try:
+        client_ip = str(ipaddress.ip_address(client_ip))
+    except ValueError:
+        return socket_ip
+    expected = hmac.new(
+        settings.jwt_secret.encode(), f"client-ip:{client_ip}".encode(), hashlib.sha256
+    ).hexdigest()
+    if hmac.compare_digest(expected, signature):
+        return client_ip
+    return socket_ip
 
 
 def _fallo_de_autenticacion(request: Request, detalle: str, esquema: str = "ApiKey") -> HTTPException:

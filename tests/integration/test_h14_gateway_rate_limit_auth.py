@@ -8,10 +8,12 @@ import json
 import time
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
 import requests
+from tests.unit.test_api_unidad import m
 
 ROOT = Path(__file__).resolve().parents[2]
 JWT_SECRET = "h14-regression-secret-at-least-32-bytes-long"
@@ -132,5 +134,26 @@ def test_h14_fallos_de_login_de_un_cliente_no_bloquean_jwt_valido_de_otro(gatewa
 
     # El Gateway no reenvía la IP falsificada por A.
     login_calls = [call for call in llamadas if call[1] == "/v1/auth/token"]
-    assert len(login_calls) == AUTH_LIMIT
+    assert len(login_calls) == AUTH_LIMIT + 1  # El intento 21 llega al proxy y Inscripción lo limita.
     assert all("X-Forwarded-For" not in call[2] for call in login_calls)
+
+
+def test_h14_inscripcion_usa_ip_firmada_y_descarta_cabecera_sin_firma(m):
+    ip_cliente = "198.51.100.22"
+    firma = hmac.new(
+        m.config.settings.jwt_secret.encode(), f"client-ip:{ip_cliente}".encode(), hashlib.sha256,
+    ).hexdigest()
+    firmada = SimpleNamespace(
+        client=SimpleNamespace(host="10.0.0.8"),
+        headers={
+            "X-Gateway-Client-IP": ip_cliente,
+            "X-Gateway-Client-IP-Signature": firma,
+        },
+    )
+    falsificada = SimpleNamespace(
+        client=SimpleNamespace(host="10.0.0.8"),
+        headers={"X-Gateway-Client-IP": ip_cliente, "X-Gateway-Client-IP-Signature": "falsa"},
+    )
+
+    assert m.security._ip(firmada) == ip_cliente
+    assert m.security._ip(falsificada) == "10.0.0.8"

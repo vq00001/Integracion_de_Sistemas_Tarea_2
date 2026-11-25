@@ -15,6 +15,14 @@ memoria. Comprueba que 20 fallos de login y el bloqueo del cliente A no afectan 
 JWT válido del cliente B. A también falsifica `X-Forwarded-For` para comprobar que
 el Gateway no confíe en una IP proporcionada por el navegador.
 
+## Mitigación
+
+El Gateway toma la IP del socket de entrada y adjunta esa IP a las solicitudes de
+Inscripción junto con una firma HMAC-SHA256 basada en el secreto JWT compartido.
+Inscripción usa la IP recibida solo si la firma es válida y el valor tiene formato
+de IP; de lo contrario conserva la IP del socket. El Gateway no reenvía la cabecera
+`X-Forwarded-For` aportada por el cliente.
+
 Ejecutar con:
 
 ```sh

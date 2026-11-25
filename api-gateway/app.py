@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import threading
@@ -127,6 +128,16 @@ def _proxy(target: str, *, injected_api_key: str | None = None):
         if key.lower()
         in {"authorization", "x-api-key", "idempotency-key", "content-type", "accept"}
     }
+    if target == INSCRIPCION_URL and request.remote_addr:
+        try:
+            client_ip = str(ipaddress.ip_address(request.remote_addr))
+        except ValueError:
+            client_ip = ""
+        if client_ip and len(JWT_SECRET) >= 32:
+            headers["X-Gateway-Client-IP"] = client_ip
+            headers["X-Gateway-Client-IP-Signature"] = hmac.new(
+                JWT_SECRET.encode(), f"client-ip:{client_ip}".encode(), hashlib.sha256
+            ).hexdigest()
     if injected_api_key is not None:
         headers.pop("Authorization", None)
         headers["X-API-Key"] = injected_api_key
