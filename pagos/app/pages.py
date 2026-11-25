@@ -21,6 +21,7 @@ _MENSAJES = {
     "EXPIRADO": ("Pago vencido", "El tiempo para pagar terminó. No se realizó ningún cobro."),
     "CANCELADO": ("Pago cancelado", "Este cobro fue cancelado. No se realizó ningún cobro."),
     "PROCESANDO": ("Confirmando pago", "Estamos confirmando tu pago con Transbank. Consulta el estado de tu matrícula en unos minutos."),
+    "REEMBOLSO_PENDIENTE": ("Devolución pendiente", "Detectamos una diferencia en el pago. Estamos gestionando su devolución. Consulta nuevamente en unos minutos."),
     "REEMBOLSADO": ("Pago reembolsado", "Este pago fue reembolsado."),
 }
 
@@ -28,8 +29,9 @@ _MENSAJES = {
 def resultado(vista: dict) -> str:
     titulo, texto = _MENSAJES.get(vista["estado"], ("Pago", "Estado del pago: " + vista["estado"]))
     monto = f"{vista['monto']:,}".replace(",", ".")
+    etiqueta = "Monto solicitado" if vista["estado"] == "REEMBOLSO_PENDIENTE" else "Monto"
     cuerpo = (f"<h2>{escape(titulo)}</h2><p>{escape(texto)}</p>"
-              f"<p style='color:#555'>Monto: ${monto} CLP<br>Referencia: {escape(vista['payment_id'])}</p>")
+              f"<p style='color:#555'>{etiqueta}: ${monto} CLP<br>Referencia: {escape(vista['payment_id'])}</p>")
     return _BASE.format(t=titulo, b=cuerpo)
 
 

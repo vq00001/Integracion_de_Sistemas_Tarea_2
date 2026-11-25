@@ -68,6 +68,19 @@ class PaymentOperation(Base):
     updated_at: Mapped[object] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
 
+class RefundDebt(Base):
+    """Autorización inconsistente: conservar la obligación antes del efecto externo."""
+    __tablename__ = "payment_refund_debts"
+    __table_args__ = (CheckConstraint("authorized_amount IS NULL OR authorized_amount > 0"),)
+
+    payment_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    authorized_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    authorized_buy_order: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reason: Mapped[str] = mapped_column(String(32), default="AUTHORIZED_MISMATCH")
+    created_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[object] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
+
+
 class PaymentSchemaVersion(Base):
     __tablename__ = "payment_schema_versions"
 

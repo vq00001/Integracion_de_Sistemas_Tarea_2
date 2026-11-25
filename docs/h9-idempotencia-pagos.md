@@ -36,7 +36,8 @@ responde `503` al reintento. Un resultado que siga sin poder determinarse necesi
 conciliación; no se responde falsamente `INEXISTENTE` ni se borra la reserva.
 
 Esta recuperación cubre los reembolsos iniciados por la compensación normal.
-El caso de una autorización con monto u orden inconsistentes corresponde a H10.
+Las autorizaciones con monto u orden inconsistentes usan esta misma protección;
+su deuda y recuperación se describen en [H10](h10-reembolso-pendiente.md).
 
 ## Actualización del esquema
 

@@ -6,7 +6,10 @@ debe devolver ese monto al mismo token y conservar el payload original local.
 No se presupone una tabla nueva ni se importa un estado aún no implementado.
 """
 import json
+import multiprocessing
+import os
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -14,8 +17,10 @@ from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select, update
 
 from pagos.app.main import create_app
+from pagos.app.models import Payment, PaymentOperation, RefundDebt
 from tests.integration.test_h9_idempotencia_pagos import (
     KEY, PAYLOAD, _competir, _filas, _post, _replay_o_reintento,
     _retener_primera_respuesta, pagos,
@@ -278,3 +283,126 @@ def test_h10_controles_no_crean_deudas_para_el_camino_feliz_ni_para_un_rechazo_r
                          {"original_key": key})
         assert response.status_code == 200 and response.json()["estado"] == "INEXISTENTE"
         assert caso.fake.calls["refund"] == 0
+
+
+@pytest.mark.parametrize("diferencia", ["monto", "orden"])
+def test_h10_deuda_y_reserva_estan_confirmadas_antes_del_efecto_externo(caso, diferencia):
+    datos = _preparar(caso, diferencia)
+    caso.control.pausar = True
+    with ThreadPoolExecutor(1) as executor:
+        futuro = executor.submit(_retornar, caso, datos)
+        try:
+            assert caso.control.entrada.wait(timeout=10)
+            assert caso.fake.calls["refund"] == 0  # servidor detenido antes de intentar la devolución
+            with caso.service.sessions() as db:
+                debt = db.get(RefundDebt, datos.payment_id)
+                assert debt.authorized_amount == datos.monto
+                assert debt.authorized_buy_order == caso.fake.tx[datos.token]["buy_order"]
+                assert db.get(PaymentOperation, (datos.payment_id, "REFUND")).phase == "RUNNING"
+                payment = db.get(Payment, datos.payment_id)
+                assert payment.estado == "PROCESANDO" and payment.notificado_at is None
+                assert payment.monto == PAYLOAD["monto"] and payment.buy_order == datos.orden_original
+        finally:
+            caso.control.liberar.set()
+        futuro.result(timeout=10)
+
+
+@pytest.mark.parametrize("diferencia", ["monto", "orden"])
+def test_h10_replay_y_metricas_conservan_la_devolucion_pendiente(caso, diferencia):
+    datos = _preparar(caso, diferencia)
+    _retornar(caso, datos)
+    with _reiniciar(caso) as (_, client):
+        page = client.get("/v1/pagos/retorno", params={"token_ws": datos.token})
+        assert page.status_code == 200 and "Devolución pendiente" in page.text
+        assert "No se realizó ningún cobro" not in page.text
+        replay = _post(client, "/v1/payments", datos.key, PAYLOAD)
+        assert replay.status_code == 200 and replay.headers["Idempotent-Replayed"] == "true"
+        assert replay.json()["estado"] == "REEMBOLSO_PENDIENTE"
+        assert replay.json()["redirect_url"] is None
+        metrics = client.get("/metrics").text
+        assert 'pagos_total{estado="REEMBOLSO_PENDIENTE"} 1' in metrics
+        assert 'pagos_total{estado="RECHAZADO"} 1' not in metrics
+        assert caso.fake.calls["create"] == caso.fake.calls["commit"] == caso.fake.calls["refund"] == 1
+        with caso.service.sessions() as db:
+            assert db.scalar(select(RefundDebt.authorized_amount).where(
+                RefundDebt.payment_id == datos.payment_id)) == datos.monto
+
+
+def _reconciliar_en_proceso(settings, listo, iniciar, salida):
+    app = create_app(settings, notifier=lambda *_: True, start_worker=False)
+    try:
+        with TestClient(app) as _:
+            listo.set()
+            if not iniciar.wait(timeout=25):
+                raise TimeoutError("No se inició el reconciliador de prueba")
+            salida.put({"pid": os.getpid(), "resultado": app.state.service.reconciliar()})
+    except Exception:
+        salida.put({"pid": os.getpid(), "error": traceback.format_exc()})
+    finally:
+        app.state.service.sessions.kw["bind"].dispose()
+
+
+@pytest.mark.parametrize("diferencia", ["monto", "orden"])
+def test_h10_dos_reconciliadores_en_procesos_distintos_no_duplican_la_devolucion(caso, diferencia):
+    datos = _preparar(caso, diferencia)
+    _retornar(caso, datos)
+    caso.control.modo = "normal"
+    mp = multiprocessing.get_context("spawn")
+    salida = mp.Queue()
+    listos, inicios = [mp.Event() for _ in range(2)], [mp.Event() for _ in range(2)]
+    workers = [mp.Process(target=_reconciliar_en_proceso,
+                          args=(caso.settings, listos[i], inicios[i], salida)) for i in range(2)]
+    with _retener_primera_respuesta(caso.fake, "reembolsar") as pausa:
+        try:
+            for worker in workers:
+                worker.start()
+            assert all(event.wait(timeout=15) for event in listos)
+            inicios[0].set()
+            assert pausa.efecto.wait(timeout=10), "El primer reconciliador no intentó la devolución pendiente"
+            inicios[1].set()
+            result = salida.get(timeout=10)  # el segundo termina mientras se retiene la primera respuesta
+            assert "error" not in result, result
+            pausa.liberar.set()
+            other = salida.get(timeout=15)
+            assert "error" not in other, other
+            assert len({result["pid"], other["pid"], os.getpid()}) == 3
+            _exigir_devolucion(caso, datos, caso.client)
+            assert caso.fake.calls["refund"] == 2
+        finally:
+            pausa.liberar.set()
+            for event in inicios:
+                event.set()
+            for worker in workers:
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+            salida.close()
+            salida.join_thread()
+
+
+@pytest.mark.parametrize("diferencia", ["monto", "orden"])
+def test_h10_autorizacion_tardia_prevalece_sobre_un_rechazo_concurrente(caso, diferencia):
+    datos = _preparar(caso, diferencia)
+    # Respuesta real de la pasarela, todavía no aplicada al registro local.
+    authorized = caso.service.webpay.confirmar(datos.token)
+    assert authorized["status"] == "AUTHORIZED" and authorized["response_code"] == 0
+    with caso.service.sessions() as db:
+        # Otro observador clasificó el commit como rechazado antes de recibir esa respuesta.
+        db.execute(update(Payment).where(Payment.id == datos.payment_id)
+                   .values(estado="RECHAZADO", tbk_status="UNKNOWN_TOKEN"))
+        db.commit()
+        payment = db.get(Payment, datos.payment_id)
+        caso.service._aplicar(db, payment, authorized)
+    assert caso.fake.tx[datos.token]["status"] == "AUTHORIZED"
+    _exigir_deuda(caso, datos)
+    assert caso.fake.calls["refund"] == 1
+    caso.control.modo = "normal"
+    with _reiniciar(caso) as (app, client):
+        app.state.service.reconciliar()
+        _exigir_devolucion(caso, datos, client)
+        assert caso.fake.calls["refund"] == 2
+        with caso.service.sessions() as db:
+            caso.service._aplicar(db, db.get(Payment, datos.payment_id), authorized)
+        _exigir_devolucion(caso, datos, client)
+        assert caso.fake.calls["refund"] == 2  # repetir la autorización no reabre la deuda saldada

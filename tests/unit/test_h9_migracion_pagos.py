@@ -78,7 +78,7 @@ def test_h9_actualizacion_conserva_datos_importa_claves_y_es_repetible(tmp_path,
             with TestClient(app) as client:
                 assert _snapshot(path) == before
                 with app.state.service.sessions() as db:
-                    assert db.scalars(select(PaymentSchemaVersion.version)).all() == [1]
+                    assert db.scalars(select(PaymentSchemaVersion.version).order_by(PaymentSchemaVersion.version)).all() == [1, 2]
                     assert {k.key: k.original_key for k in db.scalars(select(RefundKey))} == {
                         "legacy-refund": "devuelto", "legacy-cancel": "cancelado"}
                     uncertain = db.get(PaymentOperation, ("incierto", "CREATE"))
@@ -107,7 +107,7 @@ def _migrar_proceso(url, inicio, salida):
         inicio.wait(timeout=15)
         prepare_database(engine)
         with engine.connect() as conn:
-            salida.put({"versions": conn.scalars(select(PaymentSchemaVersion.version)).all()})
+            salida.put({"versions": conn.scalars(select(PaymentSchemaVersion.version).order_by(PaymentSchemaVersion.version)).all()})
     except Exception:
         salida.put({"error": traceback.format_exc()})
     finally:
@@ -129,7 +129,7 @@ def test_h9_dos_procesos_pueden_actualizar_la_misma_base(tmp_path, legacy):
             worker.start()
         inicio.wait(timeout=15)
         results = [salida.get(timeout=20) for _ in workers]
-        assert results == [{"versions": [1]}, {"versions": [1]}], "\n".join(r.get("error", str(r)) for r in results)
+        assert results == [{"versions": [1, 2]}, {"versions": [1, 2]}], "\n".join(r.get("error", str(r)) for r in results)
         if legacy:
             assert _snapshot(path) == before
     finally:

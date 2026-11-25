@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 import sqlite3
 import time
 
-from sqlalchemy import create_engine, event, insert, select, text
+from sqlalchemy import create_engine, event, insert, select, text, update
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -51,12 +51,12 @@ def make_sessions(engine):
 
 
 def prepare_database(engine):
-    """Migración aditiva H9, transaccional y serializada entre arranques.
+    """Migraciones de Pagos, transaccionales y serializadas entre arranques.
 
-    No cambia filas ni columnas de payments. Las reservas antiguas se importan
-    una vez; un cobro antiguo sin token tiene resultado desconocido y no se reenvía.
+    H9 importa las reservas antiguas. H10 recupera autorizaciones que se habían
+    marcado como rechazadas, sin reconstruir payments ni descartar su información.
     """
-    from .models import Payment, PaymentOperation, PaymentSchemaVersion, RefundKey
+    from .models import Payment, PaymentOperation, PaymentSchemaVersion, RefundDebt, RefundKey
 
     with engine.begin() as conn:
         if engine.dialect.name == "sqlite":
@@ -65,12 +65,27 @@ def prepare_database(engine):
             # Solo durante la migración, nunca mientras se llama a la pasarela.
             conn.execute(text("SELECT pg_advisory_xact_lock(344693329747)"))
         Base.metadata.create_all(conn)
-        if conn.scalar(select(PaymentSchemaVersion.version).where(PaymentSchemaVersion.version == 1)):
-            return
-        for key, original in conn.execute(select(Payment.refund_key, Payment.idempotency_key)
-                                          .where(Payment.refund_key.is_not(None))):
-            conn.execute(insert(RefundKey).values(key=key, original_key=original))
-        for pid in conn.scalars(select(Payment.id).where(Payment.estado == "PENDIENTE",
-                                                         Payment.token.is_(None))):
-            conn.execute(insert(PaymentOperation).values(payment_id=pid, operation="CREATE", phase="UNCERTAIN"))
-        conn.execute(insert(PaymentSchemaVersion).values(version=1))
+        if not conn.scalar(select(PaymentSchemaVersion.version).where(PaymentSchemaVersion.version == 1)):
+            for key, original in conn.execute(select(Payment.refund_key, Payment.idempotency_key)
+                                              .where(Payment.refund_key.is_not(None))):
+                conn.execute(insert(RefundKey).values(key=key, original_key=original))
+            for pid in conn.scalars(select(Payment.id).where(Payment.estado == "PENDIENTE",
+                                                             Payment.token.is_(None))):
+                conn.execute(insert(PaymentOperation).values(payment_id=pid, operation="CREATE", phase="UNCERTAIN"))
+            conn.execute(insert(PaymentSchemaVersion).values(version=1))
+        if not conn.scalar(select(PaymentSchemaVersion.version).where(PaymentSchemaVersion.version == 2)):
+            legacy = conn.scalars(select(Payment.id).where(
+                Payment.estado == "RECHAZADO", Payment.tbk_status.in_(("AUTHORIZED", "CAPTURED")),
+                Payment.response_code == 0)).all()
+            for pid in legacy:
+                conn.execute(insert(RefundDebt).values(payment_id=pid, reason="LEGACY_AUTHORIZED"))
+                operation = conn.scalar(select(PaymentOperation.payment_id).where(
+                    PaymentOperation.payment_id == pid, PaymentOperation.operation == "REFUND"))
+                if operation is None:
+                    conn.execute(insert(PaymentOperation).values(payment_id=pid, operation="REFUND", phase="UNCERTAIN"))
+                else:
+                    conn.execute(update(PaymentOperation).where(PaymentOperation.payment_id == pid,
+                        PaymentOperation.operation == "REFUND").values(phase="UNCERTAIN"))
+                conn.execute(update(Payment).where(Payment.id == pid)
+                             .values(estado="PROCESANDO", updated_at=Payment.updated_at))
+            conn.execute(insert(PaymentSchemaVersion).values(version=2))

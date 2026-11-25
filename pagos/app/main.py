@@ -35,7 +35,7 @@ class PagoIn(BaseModel):
 
 class PagoOut(BaseModel):
     payment_id: str | None = None
-    estado: str
+    estado: str = Field(description="REEMBOLSO_PENDIENTE conserva una autorización inconsistente hasta confirmar su devolución; no equivale a un rechazo sin cobro.")
     monto: int | None = None
     expira_at: str | None = None
     redirect_url: str | None = Field(default=None, description="Abrir en el navegador del comprador")
