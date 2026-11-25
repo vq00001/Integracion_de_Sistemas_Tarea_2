@@ -8,6 +8,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -36,6 +37,7 @@ ORCHESTRATOR_API_KEY = os.getenv("ORCHESTRATOR_API_KEY", "")
 RATE_LIMIT = max(1, int(os.getenv("GATEWAY_RATE_LIMIT", "120")))
 RATE_WINDOW = max(1, int(os.getenv("GATEWAY_RATE_WINDOW_SECONDS", "60")))
 PROXY_TIMEOUT = max(0.1, float(os.getenv("GATEWAY_PROXY_TIMEOUT_SECONDS", "30")))
+_PERSONAL_API_KEY_RE = re.compile(r"mat_[0-9a-f]{8}\.[A-Za-z0-9_-]{43}\Z")
 
 _requests: dict[str, deque[float]] = defaultdict(deque)
 _rate_lock = threading.Lock()
@@ -97,7 +99,15 @@ def _principal() -> tuple[str | None, str | None]:
     if api_key and any(hmac.compare_digest(api_key, known) for known in API_KEYS):
         g.jwt_subject = None
         g.is_m2m = True
+        g.is_personal_key = False
         return f"api-key:{hashlib.sha256(api_key.encode()).hexdigest()[:16]}", None
+    if api_key and _PERSONAL_API_KEY_RE.fullmatch(api_key):
+        # No inferimos ni confiamos en un propietario aquí. Inscripción verifica
+        # hash, vigencia, revocación y alcance de la clave antes de responder.
+        g.jwt_subject = None
+        g.is_m2m = False
+        g.is_personal_key = True
+        return f"personal-key:{hashlib.sha256(api_key.encode()).hexdigest()[:16]}", None
     return None, "Se requiere un Bearer JWT válido o una API key de integración"
 
 
@@ -247,6 +257,16 @@ def authenticate_and_limit():
         identity, error = _principal()
         if error:
             return jsonify(error={"code": "UNAUTHENTICATED", "message": error}), 401
+
+    if getattr(g, "is_personal_key", False) and (
+        request.path == "/v1/matriculas"
+        or request.path.startswith(("/v1/bff", "/v1/pagos", "/v1/sagas"))
+        or request.path == "/metrics"
+    ):
+        return jsonify(error={
+            "code": "FORBIDDEN",
+            "message": "La API key personal solo permite acceder a Inscripción",
+        }), 403
 
     allowed, retry_after = _permitir_peticion(identity)
     if not allowed:

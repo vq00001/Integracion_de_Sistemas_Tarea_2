@@ -22,3 +22,15 @@ Ejecutar con:
 
 En la versión defectuosa, el Gateway rechaza la clave personal vigente antes de
 reenviarla a Inscripción.
+
+## Mitigación
+
+El Gateway reconoce el formato emitido para claves personales y reenvía la
+credencial original solo por el proxy a Inscripción. No deriva una identidad del
+contenido de la clave: Inscripción sigue verificando su hash, propietario,
+expiración y revocación. La clave personal no se considera M2M y no habilita las
+rutas de BFF, Saga, métricas ni el inicio de matrícula delegado por el
+Orquestador. Las claves administrativas configuradas mantienen su flujo.
+
+La regresión completa de H15 pasa junto con las pruebas de Gateway para H8 y
+H14: 43 pruebas aprobadas.

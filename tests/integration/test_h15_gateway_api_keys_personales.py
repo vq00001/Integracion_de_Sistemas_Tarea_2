@@ -148,3 +148,16 @@ def test_h15_clave_administrativa_configurada_sigue_funcionando(gateway, inscrip
 
     assert response.status_code == 200, response.data
     assert requests.structures.CaseInsensitiveDict(inscripcion.calls[-1][2])["X-API-Key"] == API_KEY_ADMIN
+
+
+def test_h15_clave_personal_no_habilita_delegaciones_internas(gateway, inscripcion):
+    client = gateway.app.test_client()
+    saga = client.get("/v1/sagas/saga-1", headers={"X-API-Key": inscripcion.key_owner_a})
+    enrollment = client.post(
+        "/v1/matriculas", json={"alumno_id": "student-1"},
+        headers={"X-API-Key": inscripcion.key_owner_a},
+    )
+
+    assert saga.status_code == 403
+    assert enrollment.status_code == 403
+    assert inscripcion.calls == []
