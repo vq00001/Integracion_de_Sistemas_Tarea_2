@@ -1,5 +1,7 @@
 # Tarea 2 — Integración de Sistemas
 
+[Video explicativo del grupo: youtu.be/owScN8hdhsU](https://youtu.be/owScN8hdhsU)
+
 ## Descripción
 
 El Centro de Formación Técnica AprendeMás utiliza dos sistemas desarrollados de forma independiente:
@@ -66,15 +68,15 @@ BFF web agrega el catálogo de cursos y las matrículas para el portal. El contr
 
 ### Responsabilidades y persistencia
 
-| Componente | Tecnología | Responsabilidad |
-|---|---|---|
-| API Gateway | Python y Flask | Único punto HTTP publicado; valida JWT/API key, aplica rate limit y enruta solicitudes. |
-| BFF web | Python y Flask | Compone cursos de Cupos e inscripciones de `matriculas-api` para el portal. |
-| Cupos | Python, gRPC y SQLite | Catálogo de cursos, disponibilidad y operaciones sobre cupos. |
-| Matrículas API | Python y FastAPI | API REST, autenticación, matrícula y comunicación resiliente con Cupos. |
-| Orquestador | Python y FastAPI | Coordina la Saga persistente de cupo, pago e inscripción con compensaciones. |
-| Base de datos de Matrículas | PostgreSQL | Persistencia de estudiantes y matrículas. |
-| Matrículas legado | Node.js | Sistema de referencia que representa el estado anterior a la integración. |
+| Componente                   | Tecnología           | Responsabilidad                                                                          |
+| ---------------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| API Gateway                  | Python y Flask        | Único punto HTTP publicado; valida JWT/API key, aplica rate limit y enruta solicitudes. |
+| BFF web                      | Python y Flask        | Compone cursos de Cupos e inscripciones de `matriculas-api` para el portal.            |
+| Cupos                        | Python, gRPC y SQLite | Catálogo de cursos, disponibilidad y operaciones sobre cupos.                           |
+| Matrículas API              | Python y FastAPI      | API REST, autenticación, matrícula y comunicación resiliente con Cupos.               |
+| Orquestador                  | Python y FastAPI      | Coordina la Saga persistente de cupo, pago e inscripción con compensaciones.            |
+| Base de datos de Matrículas | PostgreSQL            | Persistencia de estudiantes y matrículas.                                               |
+| Matrículas legado           | Node.js               | Sistema de referencia que representa el estado anterior a la integración.               |
 
 Cada sistema es dueño de sus datos: Cupos utiliza SQLite en el volumen `cupos_data` y Matrículas utiliza PostgreSQL en `matriculas_db_data`. Ningún servicio consulta directamente la base de datos del otro.
 
@@ -188,7 +190,6 @@ export API_KEY="$(docker compose exec -T gateway python /usr/local/bin/service_e
 export INSCRIPCION_WRITER_KEY="$(docker compose exec -T matriculas-api python /usr/local/bin/service_env.py python -c 'import os; print(os.environ["INSCRIPCION_WRITER_KEY"])')"
 ```
 
-
 Para ejecutar la suite completa, incluidas las pruebas de falla:
 
 ```bash
@@ -208,7 +209,6 @@ python -m pytest tests -m falla -q
 ```
 
 Estas pruebas detienen y reinician servicios, por lo que deben ejecutarse sin paralelismo.
-
 
 Para ejecutar solamente las pruebas unitarias:
 
@@ -267,12 +267,12 @@ python experiment/ejecutar_todo.py --rapido
 
 Los resultados se organizan de la siguiente forma:
 
-| Ruta | Contenido |
-|---|---|
-| `experiment/data/raw/` | Datos crudos de cada escenario. |
-| `experiment/results/` | Figuras y visualizaciones. |
-| `experiment/results/resumen_<fecha>.txt` | Tablas y resultados resumidos. |
-| `experiment/data/archivo_rev/` | Resultados de una revisión anterior, no directamente comparables con los actuales. |
+| Ruta                                       | Contenido                                                                           |
+| ------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `experiment/data/raw/`                   | Datos crudos de cada escenario.                                                     |
+| `experiment/results/`                    | Figuras y visualizaciones.                                                          |
+| `experiment/results/resumen_<fecha>.txt` | Tablas y resultados resumidos.                                                      |
+| `experiment/data/archivo_rev/`           | Resultados de una revisión anterior, no directamente comparables con los actuales. |
 
 ### Consideraciones del entorno de pruebas
 
@@ -288,11 +288,11 @@ El repositorio se monta en `/repo` en los ejecutores, lo que permite reflejar ca
 
 ## Historial de versiones de los contratos
 
-| Fecha | Contrato | Cambio principal | Compatibilidad |
-|---|---|---|---|
-| 2026-09-25 | REST `/v1`, gRPC `cupo` | Versión inicial. | — |
-| 2026-10-21 | gRPC `cupo.v1` | Versionado del paquete gRPC. | Cambio de nombre del servicio; ambos extremos se regeneran conjuntamente. |
-| 2026-10-21 | REST `/v1` | `Idempotency-Key`, estado `PENDIENTE`, respuestas `502`/`504`, ajuste de `403` a `401` para claves inválidas y validación de RUT. | Cambios de comportamiento documentados en `docs/adr/`. |
+| Fecha      | Contrato                                | Cambio principal                                                                                                                                                                           | Compatibilidad                                                                  |
+| ---------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| 2026-09-25 | REST `/v1`, gRPC `cupo`             | Versión inicial.                                                                                                                                                                          | —                                                                              |
+| 2026-10-21 | gRPC `cupo.v1`                        | Versionado del paquete gRPC.                                                                                                                                                               | Cambio de nombre del servicio; ambos extremos se regeneran conjuntamente.       |
+| 2026-10-21 | REST `/v1`                            | `Idempotency-Key`, estado `PENDIENTE`, respuestas `502`/`504`, ajuste de `403` a `401` para claves inválidas y validación de RUT.                                            | Cambios de comportamiento documentados en `docs/adr/`.                        |
 | 2026-10-29 | gRPC `cupo.v1` y REST `/v1` (1.1.0) | RPC `consultarOperacion`; consultas de cursos; eliminación de estudiantes; expiración de claves; respuestas `409` y `429`; validaciones adicionales de liberación e idempotencia. | Adiciones al esquema y cambios de comportamiento documentados en `docs/adr/`. |
 
 ## Uso de inteligencia artificial
