@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from tests.conftest import CURSO_CON_CUPO, ROOT
+from tests.support.inscripciones import compensar_inscripcion, inscribir
 
 DOCS = ROOT / "matriculas-api" / "docs"
 
@@ -72,16 +73,20 @@ def test_respuestas_de_estudiantes_cumplen_el_contrato(api, api_sin_auth, spec, 
 
 def test_respuestas_de_matriculas_cumplen_el_contrato(api, spec, estudiante):
     cuerpo = {"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO}
-    creada = api.inscribir(json=cuerpo, headers={"Idempotency-Key": str(uuid.uuid4())})
+    creada = inscribir(api, json=cuerpo, headers={"Idempotency-Key": str(uuid.uuid4())})
     validar(spec, "post", "/v1/enrollments", creada)                       # 201
-    validar(spec, "post", "/v1/enrollments", api.inscribir(json=cuerpo))  # 409
+    validar(spec, "post", "/v1/enrollments", inscribir(api, json=cuerpo))  # 409
     validar(spec, "post", "/v1/enrollments",
-            api.inscribir(json={"student_id": "x", "curso_id": 1}))      # 404
+            inscribir(api, json={"student_id": "x", "curso_id": 1}))      # 404
     eid = creada.json()["id"]
     validar(spec, "get", "/v1/enrollments/{enrollment_id}", api.get(f"/v1/enrollments/{eid}"))
     validar(spec, "get", "/v1/enrollments", api.get("/v1/enrollments"))
-    validar(spec, "post", "/v1/enrollments/{enrollment_id}/revert", api.post(f"/v1/enrollments/{eid}/revert"))
-    validar(spec, "post", "/v1/enrollments/{enrollment_id}/revert", api.post(f"/v1/enrollments/{eid}/revert"))  # 409
+    for _ in range(2):
+        rechazada = api.post(f"/v1/enrollments/{eid}/revert")
+        assert rechazada.status_code == 403
+        validar(spec, "post", "/v1/enrollments/{enrollment_id}/revert", rechazada)
+    assert api.get(f"/v1/enrollments/{eid}").json() == creada.json()
+    compensar_inscripcion(creada)
 
 
 def test_respuestas_de_api_keys_y_permisos_cumplen_el_contrato(api, spec, estudiante):

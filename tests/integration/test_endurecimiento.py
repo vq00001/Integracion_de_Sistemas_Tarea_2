@@ -4,6 +4,7 @@ import uuid
 import pytest
 
 from tests.conftest import CURSO_CON_CUPO, Api, BASE_URL, rut_valido
+from tests.support.inscripciones import compensar_inscripcion, inscribir
 
 
 def _alta(api, **cambios):
@@ -64,14 +65,14 @@ def test_anonimizar_estudiante_borra_datos_personales_y_revoca_su_clave(api):
 
 def test_anonimizar_conserva_la_matricula_sin_datos_personales(api):
     est = _alta(api)[0].json()
-    m = api.inscribir(json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
+    m = inscribir(api, json={"student_id": est["id"], "curso_id": CURSO_CON_CUPO})
     assert m.status_code == 201
     try:
         assert api.delete(f"/v1/students/{est['id']}").status_code == 204
         g = api.get(f"/v1/enrollments/{m.json()['id']}")
         assert g.status_code == 200 and g.json()["estado"] == "CONFIRMADA"
     finally:
-        api.post(f"/v1/enrollments/{m.json()['id']}/revert")
+        compensar_inscripcion(m)
 
 
 def test_solo_el_admin_puede_anonimizar(api):
@@ -97,8 +98,8 @@ def test_el_prefijo_publico_no_revela_el_secreto_y_la_clave_caduca(api):
 def test_dos_estudiantes_pueden_usar_la_misma_idempotency_key_sin_enterarse(api):
     a, b = _alta(api)[0].json(), _alta(api)[0].json()
     clave = {"Idempotency-Key": f"compartida-{uuid.uuid4()}"}
-    ra = api.inscribir(json={"student_id": a["id"], "curso_id": CURSO_CON_CUPO}, headers=clave)
-    rb = api.inscribir(json={"student_id": b["id"], "curso_id": CURSO_CON_CUPO}, headers=clave)
+    ra = inscribir(api, json={"student_id": a["id"], "curso_id": CURSO_CON_CUPO}, headers=clave)
+    rb = inscribir(api, json={"student_id": b["id"], "curso_id": CURSO_CON_CUPO}, headers=clave)
     try:
         # antes: 422 IDEMPOTENCY_KEY_REUSED (oráculo que confirmaba que la clave existía)
         assert ra.status_code == 201 and rb.status_code == 201, (ra.text, rb.text)
@@ -106,17 +107,17 @@ def test_dos_estudiantes_pueden_usar_la_misma_idempotency_key_sin_enterarse(api)
     finally:
         for r in (ra, rb):
             if r.status_code == 201:
-                api.post(f"/v1/enrollments/{r.json()['id']}/revert")
+                compensar_inscripcion(r)
 
 
 def test_repetir_clave_anulada_devuelve_la_misma_inscripcion_sin_reactivarla(api):
     est = _alta(api)[0].json()
     h = {'Idempotency-Key':str(uuid.uuid4())}
     body = {'student_id':est['id'],'curso_id':CURSO_CON_CUPO}
-    first=api.inscribir(json=body,headers=h)
+    first=inscribir(api, json=body,headers=h)
     assert first.status_code == 201
-    api.post(f"/v1/enrollments/{first.json()['id']}/revert")
-    r=api.inscribir(json=body,headers=h)
+    compensar_inscripcion(first)
+    r=inscribir(api, json=body,headers=h)
     assert r.status_code == 201 and r.json()['estado'] == 'ANULADA'
     assert r.json()['id'] == first.json()['id']
 
@@ -125,19 +126,19 @@ def test_repetir_clave_anulada_devuelve_la_misma_inscripcion_sin_reactivarla(api
 
 def test_el_total_de_los_listados_es_correcto_con_filtros(api):
     est = _alta(api)[0].json()
-    ids = []
+    altas = []
     try:
         for curso in (1, 2):
-            r = api.inscribir(json={"student_id": est["id"], "curso_id": curso})
+            r = inscribir(api, json={"student_id": est["id"], "curso_id": curso})
             assert r.status_code == 201
-            ids.append(r.json()["id"])
+            altas.append(r)
         p = api.get("/v1/enrollments", params={"student_id": est["id"], "limit": 1}).json()
         assert p["total"] == 2 and len(p["items"]) == 1
         p = api.get("/v1/enrollments", params={"student_id": est["id"], "curso_id": 2}).json()
         assert p["total"] == 1
     finally:
-        for i in ids:
-            api.post(f"/v1/enrollments/{i}/revert")
+        for alta in altas:
+            compensar_inscripcion(alta)
 
 
 def test_offset_gigante_se_rechaza(api):

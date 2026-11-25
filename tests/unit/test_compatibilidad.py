@@ -81,3 +81,10 @@ def test_agregar_algo_opcional_es_compatible(base_api, actual_api):
     ok["components"]["schemas"]["EnrollmentCreate"]["properties"]["comentario"] = {"type": "string"}
     errores, _ = vc.comparar_openapi(base_api, ok)
     assert vc.errores_no_autorizados(errores) == []
+
+
+def test_excepcion_h7_no_oculta_respuestas_retiradas_de_lectura(base_api, actual_api):
+    roto = copy.deepcopy(actual_api)
+    del roto['paths']['/v1/enrollments']['get']['responses']['200']
+    errores, _ = vc.comparar_openapi(base_api, roto)
+    assert 'GET /v1/enrollments: código de respuesta eliminado 200' in vc.errores_no_autorizados(errores)

@@ -1,8 +1,8 @@
 """Inscripción local; la saga es responsable de Cupos y Pagos."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
-from sqlalchemy import func, select, update
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -12,7 +12,6 @@ from ..errors import (ConflictError, EnrollmentInProgressError,
                       IdempotencyKeyReusedError, NotFoundError)
 from ..faults import aplicar_falla
 from ..enrollment_auth import require_enrollment_writer
-from ..time import utc_now
 from ..security import Principal, exigir_acceso_a_estudiante, limitar_escrituras, require_api_key
 
 router = APIRouter(
@@ -149,24 +148,25 @@ def matricular(
 
 @router.post(
     "/{enrollment_id}/revert",
-    response_model=schemas.EnrollmentOut,
-    summary="Dar de baja una inscripción (idempotente)",
-    responses={401: {"model": schemas.ErrorResponse}, 404: {"model": schemas.ErrorResponse},
+    response_model=schemas.ErrorResponse,
+    status_code=status.HTTP_403_FORBIDDEN,
+    deprecated=True,
+    summary="Baja pública deshabilitada",
+    description=(
+        "La baja directa está deshabilitada para conservar la coherencia de la Saga: "
+        "no modifica la inscripción, la reserva ni el cobro. Las compensaciones "
+        "las ejecuta el orquestador mediante su operación interna autenticada. "
+        "No existe una operación pública de cancelación global."
+    ),
+    responses={401: {"model": schemas.ErrorResponse},
+               403: {"model": schemas.ErrorResponse, "description": "Baja pública deshabilitada; sin efectos laterales"},
                429: {"model": schemas.ErrorResponse}},
 )
-def revertir_matricula(
-    enrollment_id: str,
-    db: Session = Depends(get_db),
-    principal: Principal = Depends(require_api_key),
-):
-    limitar_escrituras(principal)
-    matricula = _matricula_o_404(db, enrollment_id, principal)
-    if matricula.estado == E.ANULADA:
-        return matricula
-    db.execute(update(models.Enrollment).where(models.Enrollment.id == enrollment_id)
-               .values(estado=E.ANULADA, updated_at=utc_now()))
-    db.commit()
-    return db.get(models.Enrollment, enrollment_id)
+def revertir_matricula(enrollment_id: str):
+    # La autenticación del router sigue vigente. No se consulta la matrícula:
+    # ninguna credencial pública ni de escritor habilita una baja fuera de la Saga.
+    raise HTTPException(status.HTTP_403_FORBIDDEN,
+                        "La baja pública está deshabilitada; las compensaciones corresponden al orquestador")
 
 
 @router.get(

@@ -1,4 +1,4 @@
-"""H7 RED: la baja pública no puede descoordinar una Saga ya completada.
+"""H7 (regresión): la baja pública no puede descoordinar una Saga ya completada.
 
 Gateway, API de Inscripción y orquestador reales en proceso; SQLite temporal.
 Solo Cupos/Pagos y el transporte HTTP son dobles. No requiere Docker, servicios
@@ -291,3 +291,43 @@ def test_h7_cancelacion_anticipada_impide_inscripcion_tardia(sistema_h7):
     assert late.json()['estado'] == 'ANULADA'
     assert late.json()['id'] == cancelled.json()['id']
     assert sistema.snapshot() == before
+
+
+@pytest.mark.parametrize('credencial', ['jwt', 'api_key_admin'])
+def test_h7_ni_la_credencial_de_escritor_habilita_la_baja_publica(sistema_h7, credencial):
+    sistema = sistema_h7
+    _, enrollment_id = _completar(sistema)
+    before = sistema.snapshot()
+    headers = {**sistema.headers[credencial],
+               'X-Enrollment-Writer-Key': _admin()['X-Enrollment-Writer-Key']}
+    response = sistema.api.post(f'/v1/enrollments/{enrollment_id}/revert', headers=headers)
+    assert response.status_code == 403, response.text
+    assert sistema.snapshot() == before
+
+
+def test_h7_baja_retirada_no_revela_existencia_de_la_inscripcion(sistema_h7):
+    sistema = sistema_h7
+    before = sistema.snapshot()
+    response = sistema.api.post('/v1/enrollments/no-existe/revert', headers=_admin())
+    assert response.status_code == 403
+    assert sistema.snapshot() == before
+
+
+@pytest.mark.parametrize('destino', ['api', 'public'])
+def test_h7_baja_sigue_exigiendo_autenticacion(sistema_h7, destino):
+    sistema = sistema_h7
+    _, enrollment_id = _completar(sistema)
+    before = sistema.snapshot()
+    response = getattr(sistema, destino).post(f'/v1/enrollments/{enrollment_id}/revert')
+    assert response.status_code == 401
+    assert sistema.snapshot() == before
+
+
+def test_h7_openapi_no_anuncia_una_baja_publica_exitosa(sistema_h7):
+    schema = sistema_h7.api.get('/openapi.json').json()
+    operation = schema['paths']['/v1/enrollments/{enrollment_id}/revert']['post']
+    assert operation['deprecated'] is True
+    assert not any(code.startswith('2') for code in operation['responses'])
+    assert operation['responses']['403']['content']['application/json']['schema'] == {
+        '$ref': '#/components/schemas/ErrorResponse'}
+    assert '/internal/enrollments/cancel' not in schema['paths']

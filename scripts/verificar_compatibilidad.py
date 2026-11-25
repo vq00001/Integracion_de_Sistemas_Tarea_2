@@ -204,12 +204,14 @@ def comparar_openapi(base: dict, actual: dict) -> tuple[list[str], list[str]]:
 
 # Migración U1 → saga solicitada: Inscripción ya no propaga fallas de Cupos.
 # La base histórica se conserva. Solo se aceptan estas eliminaciones concretas;
-# cualquier otra ruptura sigue fallando. Ver docs/saga.md.
+# cualquier otra ruptura sigue fallando. Ver docs/saga.md y docs/h7-baja-saga.md.
+# H7 retira el éxito 200 y la búsqueda 404 de la baja pública; ahora rechaza
+# con 403 y la compensación sigue en la operación interna autenticada.
 CAMBIOS_SAGA = {
     f"POST {route}: código de respuesta eliminado {code}"
     for route, codes in {
         "/v1/enrollments": (502, 504),
-        "/v1/enrollments/{enrollment_id}/revert": (409, 500, 502, 503, 504),
+        "/v1/enrollments/{enrollment_id}/revert": (200, 404, 409, 500, 502, 503, 504),
     }.items() for code in codes
 }
 

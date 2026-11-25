@@ -14,7 +14,8 @@ from .routers import courses, enrollments, health, students
 
 DESCRIPTION = """Servicio de Inscripción. Gestiona alumnos e inscripciones locales.
 La reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción ACTIVA.
-La misma Idempotency-Key devuelve la inscripción existente; repetir la baja devuelve 200.
+La misma Idempotency-Key devuelve la inscripción existente. La baja pública está deshabilitada;
+las compensaciones pertenecen a la operación interna autenticada del orquestador.
 """
 
 @asynccontextmanager

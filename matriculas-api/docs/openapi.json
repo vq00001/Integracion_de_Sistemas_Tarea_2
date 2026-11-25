@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrículas API",
-    "description": "Servicio de Inscripción. Gestiona alumnos e inscripciones locales.\nLa reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción ACTIVA.\nLa misma Idempotency-Key devuelve la inscripción existente; repetir la baja devuelve 200.\n",
+    "description": "Servicio de Inscripción. Gestiona alumnos e inscripciones locales.\nLa reserva y el cobro pertenecen al orquestador. CONFIRMADA equivale a inscripción ACTIVA.\nLa misma Idempotency-Key devuelve la inscripción existente. La baja pública está deshabilitada;\nlas compensaciones pertenecen a la operación interna autenticada del orquestador.\n",
     "version": "2.0.0"
   },
   "paths": {
@@ -1380,8 +1380,10 @@
         "tags": [
           "Matrículas"
         ],
-        "summary": "Dar de baja una inscripción (idempotente)",
+        "summary": "Baja pública deshabilitada",
+        "description": "La baja directa está deshabilitada para conservar la coherencia de la Saga: no modifica la inscripción, la reserva ni el cobro. Las compensaciones las ejecuta el orquestador mediante su operación interna autenticada. No existe una operación pública de cancelación global.",
         "operationId": "revertir_matricula_v1_enrollments__enrollment_id__revert_post",
+        "deprecated": true,
         "security": [
           {
             "ApiKeyAuth": []
@@ -1418,12 +1420,12 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Successful Response",
+          "403": {
+            "description": "Baja pública deshabilitada; sin efectos laterales",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EnrollmentOut"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1437,16 +1439,6 @@
               }
             },
             "description": "Unauthorized"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Not Found"
           },
           "429": {
             "content": {

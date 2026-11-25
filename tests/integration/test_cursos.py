@@ -2,6 +2,7 @@
 import uuid
 
 from tests.conftest import CURSO_CON_CUPO
+from tests.support.inscripciones import compensar_inscripcion, inscribir
 
 
 def test_listar_cursos_requiere_autenticacion(api_sin_auth):
@@ -49,13 +50,13 @@ def test_inscripcion_local_no_cambia_disponibilidad(api, estudiante):
     assert inicial.status_code == 200, inicial.text
     assert api.get("/v1/courses").headers["X-Cache"] == "HIT"
     antes = api.get(f"/v1/courses/{CURSO_CON_CUPO}").json()["cupos_libres"]
-    r = api.inscribir(json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO},
+    r = inscribir(api, json={"student_id": estudiante["id"], "curso_id": CURSO_CON_CUPO},
                  headers={"Idempotency-Key": str(uuid.uuid4())})
     assert r.status_code == 201
     try:
-        # tras matricular, el caché de esta réplica se invalidó: el dato ya refleja el cupo ocupado
+        # El alta local no modifica Cupos; su disponibilidad referencial se conserva.
         resp = api.get(f"/v1/courses/{CURSO_CON_CUPO}")
         assert resp.headers["X-Cache"] in ("HIT", "MISS")
         assert resp.json()["cupos_libres"] == antes
     finally:
-        api.post(f"/v1/enrollments/{r.json()['id']}/revert")
+        compensar_inscripcion(r)
