@@ -10,6 +10,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
+from urllib.parse import quote
 
 import requests
 from flask import Flask, g, jsonify, request
@@ -163,6 +164,58 @@ def _proxy(target: str, *, injected_api_key: str | None = None):
     return response
 
 
+def _comprobar_usuario_jwt():
+    """Confirma con Inscripción que el usuario asociado al JWT siga vigente.
+
+    El subject proviene del JWT ya verificado por el Gateway. La consulta reenvía
+    solo el Bearer original a la ruta de perfil, que comprueba la revocación en la
+    fuente de verdad antes de que podamos delegar con una credencial interna.
+    """
+    subject = getattr(g, "jwt_subject", None)
+    authorization = request.headers.get("Authorization", "")
+    if not subject or not authorization:
+        return jsonify(error={"code": "UNAUTHENTICATED", "message": "Bearer token inválido o revocado"}), 401
+
+    url = f"{INSCRIPCION_URL}/v1/students/{quote(subject, safe='')}"
+    try:
+        upstream = requests.request(
+            method="GET",
+            url=url,
+            headers={"Authorization": authorization},
+            data=b"",
+            timeout=PROXY_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.Timeout:
+        return jsonify(error={
+            "code": "UPSTREAM_TIMEOUT",
+            "message": "Inscripción excedió el tiempo límite al validar el usuario",
+        }), 504
+    except requests.RequestException:
+        return jsonify(error={
+            "code": "UPSTREAM_UNAVAILABLE",
+            "message": "No se pudo validar el usuario en Inscripción",
+        }), 502
+
+    if upstream.status_code == 200:
+        try:
+            perfil = json.loads(upstream.content)
+        except (TypeError, ValueError):
+            perfil = None
+        if isinstance(perfil, dict) and perfil.get("id") == subject:
+            return None
+
+    if upstream.status_code >= 500 or 300 <= upstream.status_code < 400:
+        return jsonify(error={
+            "code": "UPSTREAM_UNAVAILABLE",
+            "message": "Inscripción no pudo confirmar la vigencia del usuario",
+        }), 503
+    return jsonify(error={
+        "code": "UNAUTHENTICATED",
+        "message": "Bearer token inválido, vencido o revocado",
+    }), 401
+
+
 @app.get("/health")
 def health():
     return jsonify(status="ok", service="api-gateway")
@@ -238,6 +291,11 @@ def orchestrator_proxy(path: str = ""):
                     "message": "Solo puedes iniciar tu propia matrícula",
                 }
             ), 403
+
+    if not getattr(g, "is_m2m", False):
+        respuesta_validacion = _comprobar_usuario_jwt()
+        if respuesta_validacion is not None:
+            return respuesta_validacion
 
     upstream = _proxy(ORQUESTADOR_URL, injected_api_key=ORCHESTRATOR_API_KEY)
 

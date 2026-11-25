@@ -206,7 +206,10 @@ def test_gateway_limit_is_atomic_under_concurrent_requests(gateway, monkeypatch)
 
 
 def test_gateway_orchestrator_proxy_injects_internal_key_and_checks_owner(gateway, monkeypatch):
-    call = Mock(return_value=_upstream(201))
+    call = Mock(side_effect=[
+        _upstream(200, b'{"id":"student-1"}'),
+        _upstream(201),
+    ])
     monkeypatch.setattr(gateway.requests, "request", call)
     client = gateway.app.test_client()
     token = _jwt(gateway, subject="student-1")
@@ -222,14 +225,20 @@ def test_gateway_orchestrator_proxy_injects_internal_key_and_checks_owner(gatewa
         headers={"Authorization": f"Bearer {token}", "X-API-Key": "integration-key"},
     )
     assert accepted.status_code == 201
-    args = call.call_args.kwargs
+    identity_args, args = (item.kwargs for item in call.call_args_list)
+    assert identity_args["url"] == "http://matriculas-api:8000/v1/students/student-1"
+    assert identity_args["headers"]["Authorization"] == f"Bearer {token}"
     assert args["url"] == "http://orchestrator.test/v1/matriculas?dry_run=false"
     assert args["headers"]["X-API-Key"] == "orchestrator-secret"
     assert "Authorization" not in args["headers"]
 
 
 def test_gateway_hides_another_students_saga_and_allows_m2m_metrics(gateway, monkeypatch):
-    call = Mock(return_value=_upstream(200, b'{"alumno_id":"student-2","estado":"CONFIRMADA"}'))
+    call = Mock(side_effect=[
+        _upstream(200, b'{"id":"student-1"}'),
+        _upstream(200, b'{"alumno_id":"student-2","estado":"CONFIRMADA"}'),
+        _upstream(200),
+    ])
     monkeypatch.setattr(gateway.requests, "request", call)
     client = gateway.app.test_client()
     jwt = _jwt(gateway, subject="student-1")
