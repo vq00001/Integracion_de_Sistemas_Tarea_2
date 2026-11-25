@@ -4,6 +4,7 @@ de figuras y resumen a partir de datos sintéticos. Así un cambio de nombre en 
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from pagos.app.config import Settings
 from pagos.app.main import create_app
+from pagos.app.resilience import TransbankUnavailable
 from tests.conftest import ROOT
 from tests.support.fake_transbank import FakeTransbank
 
@@ -49,6 +51,49 @@ def test_el_experimento_lee_las_metricas_reales_de_pagos(exp, tmp_path):
     for nombre in ("bulkhead_rechazos_total", "circuito_rechazos_total"):
         assert any(n == nombre for n, _, _ in ms), nombre
     assert exp._valor(ms, "pagos_total", estado="PENDIENTE") == 1
+
+
+@pytest.mark.parametrize("fragil", ["crear", "estado"])
+def test_h11_metricas_por_operacion_no_confunden_el_alias_que_lee_el_experimento(exp, tmp_path, monkeypatch, fragil):
+    from pagos.app import resilience
+    from tests.unit.test_h11_breaker_transbank import Reloj
+
+    monkeypatch.setattr(resilience, "time", SimpleNamespace(monotonic=Reloj()))
+    fake = FakeTransbank(api_key="SECRET-H11").start()
+    cfg = Settings(database_url=f"sqlite:///{tmp_path / 'p.db'}", api_key="k" * 32, internal_key="i" * 32,
+                   callback_key="c" * 32, tbk_base_url=fake.url, tbk_api_key="SECRET-H11", reconcile_seconds=0)
+    app = create_app(cfg, notifier=lambda *_: True, start_worker=False)
+    try:
+        with TestClient(app) as client:
+            webpay = app.state.service.webpay
+            token = webpay.crear("control-h11", "sesion-h11", 100, "http://gateway.test/retorno")["token"]
+
+            def llamada(op):
+                if op == "crear":
+                    return webpay.crear("otra-h11", "sesion-h11", 100, "http://gateway.test/retorno")
+                return webpay.estado(token)
+
+            fake.config(falla=True)
+            for _ in range(5):
+                with pytest.raises(TransbankUnavailable):
+                    llamada(fragil)
+            fake.config(falla=False)
+            llamada("estado" if fragil == "crear" else "crear")
+            with pytest.raises(TransbankUnavailable) as failure:
+                llamada(fragil)
+            assert failure.value.seguro_no_enviado
+            ms = exp.parsear_metricas(client.get("/metrics").text)
+            assert exp._circuito(ms, "TRANSBANK") == ("OPEN" if fragil == "crear" else "CLOSED")
+            for op in ("crear", "estado", "confirmar", "reembolsar"):
+                estados = {e["estado"]: v for n, e, v in ms
+                           if n == "transbank_circuito_estado" and e.get("operacion") == op}
+                actual = "OPEN" if op == fragil else "CLOSED"
+                assert estados == {s: float(s == actual) for s in ("CLOSED", "OPEN", "HALF_OPEN")}
+                assert exp._valor(ms, "transbank_circuito_rechazos_total", operacion=op) == int(op == fragil)
+            assert exp._valor(ms, "circuito_rechazos_total", dependencia="TRANSBANK") == 1
+    finally:
+        fake.stop()
+        app.state.service.sessions.kw["bind"].dispose()
 
 
 def test_parseo_de_metricas_del_orquestador(exp):

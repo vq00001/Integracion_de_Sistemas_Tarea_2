@@ -245,3 +245,63 @@ def test_h11_control_half_open_admite_una_sonda_y_recupera_crear(entorno):
             entorno.client.liberar.set()
         assert probe.result(timeout=5)["token"] == "token-h11"
     assert _llamar(entorno, "crear")["token"] == "token-h11"
+
+
+@pytest.mark.parametrize("fragil", ("crear", *AUXILIARES))
+def test_h11_cada_operacion_conserva_sus_fallas_y_rechazos(entorno, fragil):
+    entorno.client.modos[fragil] = "timeout"
+    otras = [op for op in ("crear", *AUXILIARES) if op != fragil]
+    for _ in range(5):
+        with pytest.raises(TransbankUnavailable):
+            _llamar(entorno, fragil)
+        for op in otras:
+            _llamar(entorno, op)
+    before = entorno.client.calls[fragil]
+    with pytest.raises(TransbankUnavailable) as failure:
+        _llamar(entorno, fragil)
+    assert failure.value.seguro_no_enviado and entorno.client.calls[fragil] == before
+    snapshot = entorno.guard.metrics_snapshot()
+    assert snapshot["circuits"][fragil] == "OPEN"
+    assert snapshot["blocked_by_operation"][fragil] == 1
+    assert all(snapshot["circuits"][op] == "CLOSED" for op in otras)
+    assert snapshot["blocked"] == sum(snapshot["blocked_by_operation"].values()) == 1
+    assert entorno.guard.breaker is entorno.guard.breaker_for("crear")
+
+
+@pytest.mark.parametrize("operacion", ("crear", *AUXILIARES))
+def test_h11_half_open_4xx_solo_recupera_su_propia_operacion(entorno, operacion):
+    entorno.client.modos[operacion] = "timeout"
+    for _ in range(5):
+        with pytest.raises(TransbankUnavailable):
+            _llamar(entorno, operacion)
+    entorno.reloj.avanzar(31)
+    entorno.client.modos[operacion] = "rechazo"
+    with pytest.raises(TransbankRejected):
+        _llamar(entorno, operacion)
+    assert entorno.guard.metrics_snapshot()["circuits"][operacion] == "CLOSED"
+    entorno.client.modos[operacion] = "normal"
+    _llamar(entorno, operacion)
+
+
+def test_h11_el_bulkhead_sigue_limitando_la_capacidad_total_de_las_operaciones(entorno):
+    for _ in range(8):
+        assert entorno.guard.semaphore.acquire(blocking=False)
+    try:
+        for op in ("crear", *AUXILIARES):
+            with pytest.raises(TransbankUnavailable) as failure:
+                _llamar(entorno, op)
+            assert failure.value.seguro_no_enviado and entorno.client.calls[op] == 0
+    finally:
+        for _ in range(8):
+            entorno.guard.semaphore.release()
+    for op in ("crear", *AUXILIARES):
+        _llamar(entorno, op)
+    snapshot = entorno.guard.metrics_snapshot()
+    assert snapshot["rejected"] == 4 and snapshot["blocked"] == 0
+    # Una copia del snapshot no puede modificar contadores ni circuitos del Guard.
+    snapshot["calls"].clear()
+    snapshot["blocked_by_operation"]["crear"] = 999
+    snapshot["circuits"]["crear"] = "OPEN"
+    assert entorno.guard.metrics_snapshot()["calls"] == {op: 1 for op in ("crear", *AUXILIARES)}
+    assert entorno.guard.metrics_snapshot()["blocked_by_operation"]["crear"] == 0
+    assert entorno.guard.available

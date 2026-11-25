@@ -109,10 +109,13 @@ class Faults:
 
 
 class Guard:
-    """Envuelve las llamadas a Transbank: bulkhead (rechaza sin esperar) → circuito → llamada."""
+    """Bulkhead compartido → circuito independiente de la operación → llamada."""
+
+    OPERATIONS = ("crear", "confirmar", "estado", "reembolsar")
 
     def __init__(self, threshold=5, recovery=15.0, capacity=8, faults: Faults | None = None):
-        self.breaker = CircuitBreaker(threshold, recovery)
+        self._threshold, self._recovery = threshold, recovery
+        self._breakers = {name: CircuitBreaker(threshold, recovery) for name in self.OPERATIONS}
         self.semaphore = threading.BoundedSemaphore(capacity)
         self.faults = faults or Faults()
         self.rejected = 0      # bulkhead lleno
@@ -120,22 +123,47 @@ class Guard:
         self.attempted = 0     # llamadas que pasaron las barreras y se intentaron contra Transbank
         self.calls = {}
         self.seconds = {}
+        self.blocked_by_operation = {name: 0 for name in self.OPERATIONS}
         self._lock = threading.Lock()
+
+    def breaker_for(self, name: str) -> CircuitBreaker:
+        with self._lock:
+            if name not in self._breakers:
+                self._breakers[name] = CircuitBreaker(self._threshold, self._recovery)
+                self.blocked_by_operation[name] = 0
+            return self._breakers[name]
+
+    @property
+    def breaker(self) -> CircuitBreaker:
+        """Compatibilidad: el circuito histórico representa crear, no las cuatro operaciones."""
+        return self.breaker_for("crear")
 
     @property
     def available(self) -> bool:
         return self.breaker.state is not CircuitState.OPEN
 
+    def metrics_snapshot(self) -> dict:
+        """Copias de los contadores; el exportador no recorre diccionarios mutables."""
+        with self._lock:
+            breakers = tuple(self._breakers.items())
+            snapshot = dict(rejected=self.rejected, blocked=self.blocked, attempted=self.attempted,
+                            blocked_by_operation=dict(self.blocked_by_operation),
+                            calls=dict(self.calls), seconds=dict(self.seconds))
+        snapshot["circuits"] = {name: breaker.state.value for name, breaker in breakers}
+        return snapshot
+
     def call(self, name: str, timeout: float, fn, *args):
+        breaker = self.breaker_for(name)
         if not self.semaphore.acquire(blocking=False):
             with self._lock:
                 self.rejected += 1
             raise TransbankUnavailable("bulkhead lleno", seguro_no_enviado=True)
         start = time.monotonic()
         try:
-            if not self.breaker.allow_request():
+            if not breaker.allow_request():
                 with self._lock:
                     self.blocked += 1
+                    self.blocked_by_operation[name] += 1
                 raise TransbankUnavailable("circuito abierto", seguro_no_enviado=True)
             with self._lock:
                 self.attempted += 1
@@ -143,15 +171,15 @@ class Guard:
                 self.faults.apply(timeout)
                 result = fn(*args)
             except TransbankRejected:
-                self.breaker.record_success()
+                breaker.record_success()
                 raise
             except TransbankUnavailable:
-                self.breaker.record_failure()
+                breaker.record_failure()
                 raise
             except Exception as exc:  # timeout, red caída, etc.
-                self.breaker.record_failure()
+                breaker.record_failure()
                 raise TransbankUnavailable(type(exc).__name__) from exc
-            self.breaker.record_success()
+            breaker.record_success()
             return result
         finally:
             with self._lock:

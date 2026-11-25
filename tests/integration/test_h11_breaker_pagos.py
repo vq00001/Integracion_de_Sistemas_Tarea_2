@@ -110,11 +110,17 @@ def test_h11_api_consulta_no_cierra_half_open_y_solo_una_creacion_prueba_recuper
         try:
             assert ctx.control.entrada.wait(timeout=10), "No entró la sonda HTTP de creación"
             assert not probe.done()
+            metrics = ctx.client.get("/metrics").text
+            assert 'circuito_estado{dependencia="TRANSBANK",estado="HALF_OPEN"} 1' in metrics
+            assert 'transbank_circuito_estado{operacion="crear",estado="HALF_OPEN"} 1' in metrics
+            assert 'transbank_circuito_estado{operacion="estado",estado="CLOSED"} 1' in metrics
             response = _post(ctx.client, "/v1/payments", "h11-esperar-sonda:COBRAR", PAYLOAD)
             _exigir_rechazo_local(ctx, response, baseline + 5)
+            assert 'transbank_circuito_rechazos_total{operacion="crear"} 1' in ctx.client.get("/metrics").text
         finally:
             ctx.control.liberar.set()
         assert probe.result(timeout=10).status_code == 201
+    assert 'transbank_circuito_estado{operacion="crear",estado="CLOSED"} 1' in ctx.client.get("/metrics").text
     # La misma clave rechazada localmente puede continuar tras una recuperación real de crear.
     replay = _post(ctx.client, "/v1/payments", "h11-esperar-sonda:COBRAR", PAYLOAD)
     assert replay.status_code == 200 and replay.headers["Idempotent-Replayed"] == "true"

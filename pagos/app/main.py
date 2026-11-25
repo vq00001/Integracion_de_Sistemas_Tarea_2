@@ -177,15 +177,21 @@ def create_app(settings: Settings | None = None, webpay: Webpay | None = None, n
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
+        snapshot = guard.metrics_snapshot()
         lines = [f'pagos_total{{estado="{k}"}} {v}' for k, v in service.conteos().items()]
         for st in ("CLOSED", "OPEN", "HALF_OPEN"):
-            lines.append(f'circuito_estado{{dependencia="TRANSBANK",estado="{st}"}} {int(guard.breaker.state.value == st)}')
-        lines.append(f'bulkhead_rechazos_total{{dependencia="TRANSBANK"}} {guard.rejected}')
-        lines.append(f'circuito_rechazos_total{{dependencia="TRANSBANK"}} {guard.blocked}')
-        lines.append(f'transbank_intentos_total {guard.attempted}')
-        for op, n in guard.calls.items():
+            # Alias histórico de crear para los experimentos y consumidores existentes.
+            lines.append(f'circuito_estado{{dependencia="TRANSBANK",estado="{st}"}} {int(snapshot["circuits"]["crear"] == st)}')
+        for op, state in snapshot["circuits"].items():
+            for st in ("CLOSED", "OPEN", "HALF_OPEN"):
+                lines.append(f'transbank_circuito_estado{{operacion="{op}",estado="{st}"}} {int(state == st)}')
+            lines.append(f'transbank_circuito_rechazos_total{{operacion="{op}"}} {snapshot["blocked_by_operation"][op]}')
+        lines.append(f'bulkhead_rechazos_total{{dependencia="TRANSBANK"}} {snapshot["rejected"]}')
+        lines.append(f'circuito_rechazos_total{{dependencia="TRANSBANK"}} {snapshot["blocked"]}')
+        lines.append(f'transbank_intentos_total {snapshot["attempted"]}')
+        for op, n in snapshot["calls"].items():
             lines.append(f'transbank_llamadas_total{{operacion="{op}"}} {n}')
-            lines.append(f'transbank_duracion_seconds_sum{{operacion="{op}"}} {guard.seconds.get(op, 0.0)}')
+            lines.append(f'transbank_duracion_seconds_sum{{operacion="{op}"}} {snapshot["seconds"].get(op, 0.0)}')
         return "\n".join(lines) + "\n"
 
     return app
