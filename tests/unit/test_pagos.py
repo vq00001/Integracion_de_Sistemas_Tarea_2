@@ -4,6 +4,7 @@ Cubre el ciclo del cobro (crear → comprador paga → retorno → COBRADO/RECHA
 la compensación (reembolso / cancelación anticipada), el commit incierto y la resiliencia hacia
 Transbank (timeout, circuit breaker con recuperación y bulkhead).
 """
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -248,12 +249,43 @@ def test_transbank_lento_o_caido_abre_el_circuito_y_responde_rapido(ctx):
     assert 'estado="CLOSED"} 1' in ctx.c.get("/metrics").text
 
 
-def test_bulkhead_rechaza_el_exceso_sin_esperar(ctx):
-    ctx.fake.config(latencia_ms=250)
+def test_bulkhead_rechaza_el_exceso_sin_esperar(ctx, monkeypatch):
+    saturado, liberar = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    admitidas = 0
+    client = ctx.app.state.service.webpay.client
+    crear_real = client.crear
+
+    def crear_bloqueado(*args):
+        nonlocal admitidas
+        # Guard ya adquirió el permiso: retenemos las dos llamadas dentro del bulkhead.
+        with lock:
+            admitidas += 1
+            if admitidas == 2:
+                saturado.set()
+        assert liberar.wait(timeout=30), "La prueba no liberó las llamadas admitidas"
+        return crear_real(*args)
+
+    monkeypatch.setattr(client, "crear", crear_bloqueado)
     with ThreadPoolExecutor(8) as ex:
-        codigos = [r.status_code for _, r in ex.map(lambda _: crear(ctx), range(8))]
-    assert codigos.count(201) == 2 and codigos.count(503) == 6  # capacidad 2 (PAGOS_BULKHEAD)
-    assert ctx.app.state.guard.rejected == 6
+        aceptadas = [ex.submit(crear, ctx) for _ in range(2)]
+        try:
+            assert saturado.wait(timeout=10), "No se ocuparon los dos permisos del bulkhead"
+            exceso = [ex.submit(crear, ctx) for _ in range(6)]
+            rechazadas = [f.result(timeout=10)[1] for f in exceso]
+            # El exceso debe responder antes de liberar la dependencia; no depende de un sleep.
+            assert [r.status_code for r in rechazadas] == [503] * 6
+            assert all(r.headers.get("Retry-After") for r in rechazadas)
+            assert all(not f.done() for f in aceptadas)
+            assert admitidas == 2 and ctx.app.state.guard.rejected == 6
+            assert ctx.fake.calls["create"] == 0
+        finally:
+            liberar.set()
+        assert [f.result(timeout=10)[1].status_code for f in aceptadas] == [201, 201]
+
+    assert ctx.fake.calls["create"] == 2  # los seis rechazos no llegaron a Transbank
+    assert crear(ctx)[1].status_code == 201  # se recupera la capacidad, sin permisos retenidos
+    assert ctx.fake.calls["create"] == 3 and ctx.app.state.guard.rejected == 6
 
 
 def test_confirmar_y_consultar_funcionan_con_el_circuito_cerrado_tras_una_falla_aislada(ctx):
