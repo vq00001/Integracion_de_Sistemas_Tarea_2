@@ -21,11 +21,11 @@ import urllib.request
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .database import utc_now
-from .models import Payment
+from .models import Payment, PaymentOperation, RefundKey
 from .resilience import TransbankRejected, TransbankUnavailable
 
 log = logging.getLogger("pagos")
@@ -122,6 +122,55 @@ class PagosService:
             except Exception:
                 log.warning(json.dumps({"evento": "aviso_fallido", "payment_id": p.id}))
 
+    @staticmethod
+    def _reservar_clave_reembolso(db, key: str, original_key: str) -> None:
+        binding = db.get(RefundKey, key)
+        if binding is None:
+            db.add(RefundKey(key=key, original_key=original_key))
+            try:
+                db.commit()
+                return
+            except IntegrityError:
+                db.rollback()
+                binding = db.get(RefundKey, key)
+                if binding is None:
+                    raise
+        if binding.original_key != original_key:
+            raise IdempotencyConflict("La clave de reembolso identifica otro cobro")
+
+    @staticmethod
+    def _reservar_operacion(db, p: Payment, operation: str, refund_key=None) -> bool:
+        """La PK y el UPDATE condicional excluyen procesos sin retener locks de BD en HTTP."""
+        db.add(PaymentOperation(payment_id=p.id, operation=operation))
+        try:
+            db.flush()
+            condition = Payment.estado == ("PENDIENTE" if operation == "CREATE" else "COBRADO")
+            values = {"updated_at": utc_now()}
+            if operation == "CREATE":
+                condition &= Payment.token.is_(None)
+            else:
+                values["refund_key"] = func.coalesce(Payment.refund_key, refund_key)
+            result = db.execute(update(Payment).where(Payment.id == p.id, condition).values(**values))
+            if result.rowcount != 1:
+                db.rollback()
+                return False
+            db.commit()
+            db.refresh(p)
+            return True
+        except IntegrityError:
+            db.rollback()
+            return False
+
+    @staticmethod
+    def _resultado_operacion(db, pid: str, operation: str, phase: str | None) -> None:
+        condition = (PaymentOperation.payment_id == pid, PaymentOperation.operation == operation,
+                     PaymentOperation.phase != "DONE")
+        if phase is None:  # rechazo conocido antes del envío, o respuesta negativa definitiva
+            db.execute(delete(PaymentOperation).where(*condition))
+        else:
+            db.execute(update(PaymentOperation).where(*condition).values(phase=phase))
+        db.commit()
+
     # ------------------------------------------------------------------ 1. crear
     def crear(self, key: str, alumno_id: str, curso_id: int, monto: int):
         with self.sessions() as db:
@@ -146,17 +195,32 @@ class PagosService:
                 self._expirar(db, p)
                 if p.token is not None or p.estado != "PENDIENTE":
                     return self.vista(p), False
-            # Nuevo, o reintento de una creación que no llegó a obtener el token de Webpay.
+            if not self._reservar_operacion(db, p, "CREATE"):
+                db.refresh(p)
+                if p.estado == "CANCELADO":
+                    raise PagoCancelado("El cobro fue cancelado")
+                if p.token is not None or p.estado != "PENDIENTE":
+                    return self.vista(p), False
+                raise Reintentar("La creación está en curso o su resultado es incierto")
             try:
                 r = self.webpay.crear(p.buy_order, p.session_id, p.monto, self.return_url)
             except TransbankRejected as exc:
                 if exc.http_status in (401, 403):
+                    self._resultado_operacion(db, p.id, "CREATE", None)
                     raise TransbankUnavailable("credenciales de Transbank inválidas")
                 self._cas(db, p.id, ("PENDIENTE",), "RECHAZADO", tbk_status="CREATE_REJECTED")
+                self._resultado_operacion(db, p.id, "CREATE", "DONE")
                 db.refresh(p)
                 return self.vista(p), created
-            if not self._cas(db, p.id, ("PENDIENTE",), "PENDIENTE", token=r["token"], webpay_url=r["url"]):
-                raise PagoCancelado("El cobro fue cancelado mientras se creaba la transacción")
+            except TransbankUnavailable as exc:
+                self._resultado_operacion(db, p.id, "CREATE", None if exc.seguro_no_enviado else "UNCERTAIN")
+                raise
+            except Exception:
+                self._resultado_operacion(db, p.id, "CREATE", "UNCERTAIN")
+                raise
+            # Conservar la transacción externa incluso si el pago venció durante la llamada.
+            db.execute(update(Payment).where(Payment.id == p.id).values(token=r["token"], webpay_url=r["url"]))
+            self._resultado_operacion(db, p.id, "CREATE", "DONE")
             db.refresh(p)
             return self.vista(p), created
 
@@ -252,6 +316,7 @@ class PagosService:
     # ------------------------------------------------------------------ 4. compensación
     def reembolsar(self, refund_key: str, original_key: str) -> dict:
         with self.sessions() as db:
+            self._reservar_clave_reembolso(db, refund_key, original_key)
             p = self._por_clave(db, original_key)
             if p is None:
                 # Cancelación anticipada: un cobro tardío con esta clave ya no puede ejecutarse.
@@ -272,8 +337,21 @@ class PagosService:
                 if p.estado == "REEMBOLSADO":
                     return {"estado": "REEMBOLSADO", "tipo": p.refund_type}
                 if p.estado == "PENDIENTE":
-                    if self._cas(db, p.id, ("PENDIENTE",), "CANCELADO", refund_key=p.refund_key or refund_key):
+                    # PostgreSQL espera al escritor del pago antes de tomar el snapshot
+                    # de las reservas; SQLite serializa el UPDATE condicional siguiente.
+                    db.execute(select(Payment.id).where(Payment.id == p.id).with_for_update())
+                    active_creation = select(PaymentOperation.payment_id).where(
+                        PaymentOperation.payment_id == p.id, PaymentOperation.operation == "CREATE",
+                        PaymentOperation.phase == "RUNNING").exists()
+                    cancelled = db.execute(update(Payment).where(
+                        Payment.id == p.id, Payment.estado == "PENDIENTE", ~active_creation)
+                        .values(estado="CANCELADO", refund_key=func.coalesce(Payment.refund_key, refund_key)))
+                    db.commit()
+                    if cancelled.rowcount == 1:
                         return {"estado": "CANCELADO"}
+                    creation = db.get(PaymentOperation, (p.id, "CREATE"))
+                    if creation is not None and creation.phase == "RUNNING":
+                        raise Reintentar("Hay una creación en curso; reintentar la cancelación")
                     continue  # cambió de estado en paralelo: reevaluar
                 if p.estado == "PROCESANDO":
                     raise Reintentar("Hay una confirmación en curso; reintentar")
@@ -285,26 +363,66 @@ class PagosService:
             raise Reintentar("El pago cambia de estado; reintentar")
 
     def _reembolsar_cobro(self, db, p: Payment, refund_key: str) -> dict:
+        if not self._reservar_operacion(db, p, "REFUND", refund_key):
+            db.refresh(p)
+            if p.estado == "REEMBOLSADO":
+                return {"estado": "REEMBOLSADO", "tipo": p.refund_type}
+            operation = db.get(PaymentOperation, (p.id, "REFUND"))
+            if operation is not None and operation.phase in ("RUNNING", "UNCERTAIN"):
+                if self._resolver_reembolso(db, p):
+                    return {"estado": "REEMBOLSADO", "tipo": p.refund_type}
+            raise Reintentar("El reembolso está en curso o su resultado es incierto")
         try:
             r = self.webpay.reembolsar(p.token, p.monto)
             tipo = r.get("type")
             if r.get("response_code") not in (0, None):
+                self._resultado_operacion(db, p.id, "REFUND", None)
                 raise ReembolsoRechazado("Transbank no aceptó el reembolso")
         except TransbankRejected as exc:
             # ¿Ya estaba reembolsado? Se pregunta antes de declarar el fallo.
             try:
                 tipo = self.webpay.estado(p.token).get("status")
             except (TransbankUnavailable, TransbankRejected):
+                self._resultado_operacion(db, p.id, "REFUND", None)
                 raise Reintentar("No se pudo confirmar el reembolso")
             if tipo not in ("REVERSED", "NULLIFIED"):
+                self._resultado_operacion(db, p.id, "REFUND", None)
                 raise ReembolsoRechazado(f"Transbank rechazó el reembolso (HTTP {exc.http_status})")
-        self._cas(db, p.id, ("COBRADO",), "REEMBOLSADO", refund_key=refund_key, refund_type=str(tipo)[:16])
+        except TransbankUnavailable as exc:
+            self._resultado_operacion(db, p.id, "REFUND", None if exc.seguro_no_enviado else "UNCERTAIN")
+            raise
+        except ReembolsoRechazado:
+            raise
+        except Exception:
+            self._resultado_operacion(db, p.id, "REFUND", "UNCERTAIN")
+            raise
+        if tipo not in ("REVERSED", "NULLIFIED"):
+            self._resultado_operacion(db, p.id, "REFUND", "UNCERTAIN")
+            raise Reintentar("Respuesta de reembolso sin resultado definitivo")
+        self._completar_reembolso(db, p, tipo)
         return {"estado": "REEMBOLSADO", "tipo": tipo}
+
+    def _completar_reembolso(self, db, p: Payment, tipo: str) -> None:
+        db.execute(update(Payment).where(Payment.id == p.id, Payment.estado == "COBRADO")
+                   .values(estado="REEMBOLSADO", refund_type=tipo))
+        self._resultado_operacion(db, p.id, "REFUND", "DONE")
+        db.refresh(p)
+
+    def _resolver_reembolso(self, db, p: Payment) -> bool:
+        """Recuperar una respuesta perdida consultando; nunca repetir un POST incierto."""
+        try:
+            tipo = self.webpay.estado(p.token).get("status")
+        except (TransbankUnavailable, TransbankRejected):
+            return False
+        if tipo not in ("REVERSED", "NULLIFIED"):
+            return False
+        self._completar_reembolso(db, p, tipo)
+        return True
 
     # ------------------------------------------------------------------ reconciliación
     def reconciliar(self) -> dict:
         ahora = utc_now()
-        hecho = {"expirados": 0, "resueltos": 0, "avisados": 0}
+        hecho = {"expirados": 0, "resueltos": 0, "avisados": 0, "reembolsos_resueltos": 0}
         with self.sessions() as db:
             r = db.execute(update(Payment).where(Payment.estado == "PENDIENTE", Payment.expires_at <= ahora)
                            .values(estado="EXPIRADO", tbk_status="EXPIRED"))
@@ -319,6 +437,12 @@ class PagosService:
                     hecho["resueltos"] += 1
                 except (TransbankUnavailable, TransbankRejected):
                     pass
+            reembolsos = db.scalars(select(Payment).join(
+                PaymentOperation, PaymentOperation.payment_id == Payment.id).where(
+                    Payment.estado == "COBRADO", PaymentOperation.operation == "REFUND",
+                    PaymentOperation.phase.in_(("RUNNING", "UNCERTAIN"))).limit(50)).all()
+            for p in reembolsos:
+                hecho["reembolsos_resueltos"] += int(self._resolver_reembolso(db, p))
             pendientes = db.scalars(select(Payment).where(
                 Payment.estado.in_(NOTIFICABLES), Payment.notificado_at.is_(None),
                 Payment.created_at > ahora - timedelta(days=1)).limit(50)).all()

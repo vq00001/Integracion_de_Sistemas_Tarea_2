@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from . import pages
 from .config import Settings
-from .database import Base, make_engine, make_sessions
+from .database import make_engine, make_sessions, prepare_database
 from .resilience import Faults, Guard, TransbankUnavailable
 from .service import HttpNotifier, PagosError, PagosService
 from .transbank import TransbankClient, Webpay
@@ -74,7 +74,7 @@ def create_app(settings: Settings | None = None, webpay: Webpay | None = None, n
     @asynccontextmanager
     async def lifespan(app):
         s.validar()
-        Base.metadata.create_all(engine)
+        prepare_database(engine)
         stop = threading.Event()
 
         def loop():

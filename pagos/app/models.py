@@ -42,3 +42,34 @@ class Payment(Base):
     notificado_at: Mapped[object | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
     updated_at: Mapped[object] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class RefundKey(Base):
+    """Cada clave, incluidos los aliases de un replay, pertenece a un solo cobro."""
+    __tablename__ = "payment_refund_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    original_key: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
+
+
+class PaymentOperation(Base):
+    """Reserva durable antes de enviar CREATE o REFUND; no es un lock en memoria."""
+    __tablename__ = "payment_operations"
+    __table_args__ = (
+        CheckConstraint("operation IN ('CREATE', 'REFUND')"),
+        CheckConstraint("phase IN ('RUNNING', 'UNCERTAIN', 'DONE')"),
+    )
+
+    payment_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(8), primary_key=True)
+    phase: Mapped[str] = mapped_column(String(12), default="RUNNING")
+    created_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[object] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class PaymentSchemaVersion(Base):
+    __tablename__ = "payment_schema_versions"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[object] = mapped_column(DateTime, default=utc_now)
